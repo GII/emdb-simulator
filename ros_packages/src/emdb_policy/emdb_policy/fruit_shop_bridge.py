@@ -105,9 +105,8 @@ from emdb_policy.scripted_policies import (
     IdleMotion,
     compute_base_delta,
     REACH_THRESHOLD,
-    BASE_STANDOFF_DISTANCE,
-    BASE_ARRIVED_TOLERANCE,
     MAX_BASE_REPOSITION_STEPS,
+    BASE_DIVERGENCE_MARGIN,
 )
 
 DIM_MIN = 0.03  # meters, matches fruit_shop_sim_discrete.py's generate_fruits()
@@ -395,15 +394,25 @@ class FruitShopBridge(Node):
         self.agent_bridge.set_base_mode(True)
         try:
             # compute_base_delta drives toward a point BASE_STANDOFF_DISTANCE
-            # short of target_pos (it parks nearby, not on top of it), so
-            # "arrived" means distance-to-target has come down to roughly
-            # that standoff distance, not all the way to zero.
-            arrived_distance = BASE_STANDOFF_DISTANCE + BASE_ARRIVED_TOLERANCE
+            # short of target_pos, but this loop's own goal is narrower --
+            # just get back within arm reach, not necessarily all the way to
+            # the standoff point (BASE_STANDOFF_DISTANCE < REACH_THRESHOLD,
+            # so this stops sooner, saving real repositioning time -- the
+            # actual per-step progress is much slower/burstier than
+            # BASE_MAX_DELTA alone would suggest, see MAX_BASE_REPOSITION_STEPS).
             steps_taken = 0
+            best_distance = start_distance
             for _ in range(MAX_BASE_REPOSITION_STEPS):
                 target_pos = self._last_obs[target_pos_key]
                 base_dx, base_dy, distance = compute_base_delta(self._last_obs, target_pos)
-                if distance <= arrived_distance:
+                if distance <= REACH_THRESHOLD:
+                    break
+                best_distance = min(best_distance, distance)
+                if distance > best_distance + BASE_DIVERGENCE_MARGIN:
+                    self.get_logger().warning(
+                        f"base repositioning toward {target_pos_key} is diverging "
+                        f"(best={best_distance:.2f}m, now={distance:.2f}m) -- giving up early"
+                    )
                     break
                 obs, _reward, terminated, truncated, _info = self.agent_bridge.step(
                     base_dx=base_dx, base_dy=base_dy

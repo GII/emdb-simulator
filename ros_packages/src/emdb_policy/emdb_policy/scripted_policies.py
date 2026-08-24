@@ -55,9 +55,27 @@ ASK_NICELY_WAIT_STEPS = 30  # default idle duration for IdleMotion
 REACH_THRESHOLD = 0.45  # meters (planar); beyond this, reposition the base first
 BASE_STANDOFF_DISTANCE = 0.3  # meters short of the target to park the base
 BASE_ARRIVED_TOLERANCE = 0.05  # meters; considered "close enough", stop repositioning
-MAX_BASE_REPOSITION_STEPS = 150
+# OmronMobileBase's velocity actuator shows real stiction-like behavior in
+# practice (empirically traced via a live scene: many consecutive steps at a
+# constant commanded base_dx/base_dy produce near-zero actual displacement,
+# interspersed with bursts of real movement) -- true achieved progress can
+# run 5-10x slower than BASE_MAX_DELTA per step would suggest, not a steady
+# rate. MAX_BASE_REPOSITION_STEPS is budgeted generously (not just
+# distance/BASE_MAX_DELTA) to tolerate that.
+MAX_BASE_REPOSITION_STEPS = 500
 BASE_KP = 2.0
 BASE_MAX_DELTA = 0.05  # meters/step, matches OmronMobileBase's velocity-actuator scale
+# Empirically (live-scene testing), the P-control direction isn't reliably
+# stable for every base orientation/target geometry -- one traced case
+# consistently walked AWAY from a target it started only 0.62m from,
+# growing to 0.83m over a full 500-step budget instead of converging.
+# Root cause not fully isolated (suspected: robot_base_ori sampled once per
+# step while the base is still physically settling from the previous
+# command, compounding into a bad heading estimate for some geometries).
+# Until that's root-caused, bail out early if distance clearly grows past
+# the best point reached, rather than blindly spending the whole budget
+# walking further from the target.
+BASE_DIVERGENCE_MARGIN = 0.15  # meters worse than the best distance seen -> give up
 
 
 def compute_base_delta(obs_dict, target_pos, standoff_distance=BASE_STANDOFF_DISTANCE,
