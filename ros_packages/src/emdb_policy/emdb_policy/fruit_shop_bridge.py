@@ -103,6 +103,11 @@ from emdb_policy.scripted_policies import (
     TransportReleaseMotion,
     ApproachOnlyMotion,
     IdleMotion,
+    compute_base_delta,
+    REACH_THRESHOLD,
+    BASE_STANDOFF_DISTANCE,
+    BASE_ARRIVED_TOLERANCE,
+    MAX_BASE_REPOSITION_STEPS,
 )
 
 DIM_MIN = 0.03  # meters, matches fruit_shop_sim_discrete.py's generate_fruits()
@@ -345,7 +350,20 @@ class FruitShopBridge(Node):
         updating self._last_obs as it goes. Returns True if the motion
         reached STATE_DONE within max_steps, False on timeout/termination --
         a real physical failure (e.g. a missed grasp), unlike the reference
-        sim where every policy call always succeeds."""
+        sim where every policy call always succeeds.
+
+        Repositions the base first if motion's target is out of arm reach
+        (see _ensure_within_reach) -- accepted/rejected/scale can land at
+        opposite corners of a wide island (fruit_shop_task.py's
+        _get_obj_cfgs), well beyond the UR5e's reach from wherever the
+        robot spawned (tied to the fruit's own placement, not the island
+        center)."""
+        target_pos_key = getattr(motion, "TARGET_POS_KEY", None) or getattr(
+            motion, "OBJ_POS_KEY", None
+        )
+        if target_pos_key is not None:
+            self._ensure_within_reach(target_pos_key)
+
         for _ in range(max_steps):
             action = motion.policy_fn(self._last_obs, self.rng)
             obs, _reward, terminated, truncated, _info = self.agent_bridge.step_vector(action)
@@ -355,6 +373,50 @@ class FruitShopBridge(Node):
             if terminated or truncated:
                 return False
         return False
+
+    def _ensure_within_reach(self, target_pos_key):
+        """If target_pos_key is farther than REACH_THRESHOLD (planar) from
+        the robot's current base position, drive the mobile base closer
+        before letting the caller's arm motion run. No-op (fast) when
+        already in reach, which is the common case -- most layouts don't
+        need this at all."""
+        target_pos = self._last_obs.get(target_pos_key)
+        base_pos = self._last_obs.get("robot_base_pos")
+        if target_pos is None or base_pos is None:
+            return
+        start_distance = float(np.linalg.norm(target_pos[:2] - base_pos[:2]))
+        if start_distance <= REACH_THRESHOLD:
+            return
+
+        self.get_logger().info(
+            f"{target_pos_key} is {start_distance:.2f}m away (> {REACH_THRESHOLD}m reach) "
+            "-- repositioning base"
+        )
+        self.agent_bridge.set_base_mode(True)
+        try:
+            # compute_base_delta drives toward a point BASE_STANDOFF_DISTANCE
+            # short of target_pos (it parks nearby, not on top of it), so
+            # "arrived" means distance-to-target has come down to roughly
+            # that standoff distance, not all the way to zero.
+            arrived_distance = BASE_STANDOFF_DISTANCE + BASE_ARRIVED_TOLERANCE
+            steps_taken = 0
+            for _ in range(MAX_BASE_REPOSITION_STEPS):
+                target_pos = self._last_obs[target_pos_key]
+                base_dx, base_dy, distance = compute_base_delta(self._last_obs, target_pos)
+                if distance <= arrived_distance:
+                    break
+                obs, _reward, terminated, truncated, _info = self.agent_bridge.step(
+                    base_dx=base_dx, base_dy=base_dy
+                )
+                self._last_obs = obs
+                steps_taken += 1
+                if terminated or truncated:
+                    break
+            self.get_logger().info(
+                f"base repositioned in {steps_taken} steps, now {distance:.2f}m from {target_pos_key}"
+            )
+        finally:
+            self.agent_bridge.set_base_mode(False)
 
     # ------------------------------------------------ policy implementations
     # Each ports its FruitShopSim counterpart's decision logic (when to act,
@@ -400,6 +462,10 @@ class FruitShopBridge(Node):
                 self.scale_active = True
                 if self.scale_state == 0:
                     self.scale_state = 1 if self.rng.uniform() > 0.5 else 2
+                    if self.scale_state == 2:
+                        # Reveal "rotten" only now -- the scale is what tells
+                        # us it's bad, not a look at the fruit beforehand.
+                        self.agent_bridge.mark_object_rotten("fruit")
             self.tested_fruit = self.catched_fruit
             self.catched_fruit = None
         return success

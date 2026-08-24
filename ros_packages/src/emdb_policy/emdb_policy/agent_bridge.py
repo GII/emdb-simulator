@@ -17,7 +17,13 @@ from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 
 from emdb_interfaces.msg import Observation, StepInfo
-from emdb_interfaces.srv import ResetEpisode, StepAction, StepActionRaw
+from emdb_interfaces.srv import (
+    MarkObjectRotten,
+    ResetEpisode,
+    SetDeltaAction,
+    StepAction,
+    StepActionRaw,
+)
 
 
 def observation_to_dict(msg: Observation):
@@ -45,6 +51,13 @@ class AgentBridge(Node):
         self._gripper_closed = False
         self._executor = None
         self._spin_thread = None
+        # /set_delta_action's toggle_base_mode is the only way to flip
+        # scene_loader's shared device.base_mode flag (StepAction has no
+        # such field) -- but _set_delta_action_cb_impl has no control_mode
+        # guard, so it works fine alongside control_mode:=rl. Tracked here
+        # so set_base_mode() only sends a toggle when the mode is actually
+        # changing (it's a toggle, not a set).
+        self._base_mode_on = False
 
         self.create_subscription(Observation, "/observations", self._on_observation, 10)
         self.create_subscription(StepInfo, "/reward", self._on_step_info, 10)
@@ -52,6 +65,8 @@ class AgentBridge(Node):
         self._step_cli = self.create_client(StepAction, "/step_action")
         self._step_raw_cli = self.create_client(StepActionRaw, "/step_action_raw")
         self._reset_cli = self.create_client(ResetEpisode, "/reset_episode")
+        self._mark_rotten_cli = self.create_client(MarkObjectRotten, "/mark_object_rotten")
+        self._set_delta_cli = self.create_client(SetDeltaAction, "/set_delta_action")
 
     def start(self):
         """Spin this node on a background thread so blocking step()/reset() calls work."""
@@ -70,6 +85,8 @@ class AgentBridge(Node):
             (self._step_cli, "/step_action"),
             (self._step_raw_cli, "/step_action_raw"),
             (self._reset_cli, "/reset_episode"),
+            (self._mark_rotten_cli, "/mark_object_rotten"),
+            (self._set_delta_cli, "/set_delta_action"),
         )
         for cli, name in clients:
             if not cli.wait_for_service(timeout_sec=timeout_sec):
@@ -136,6 +153,40 @@ class AgentBridge(Node):
         self._gripper_closed = False
         obs, _info = self._wait_for_step(response.episode_id, 0, self._reset_timeout_sec)
         return obs
+
+    def mark_object_rotten(self, object_name):
+        """Recolor object_name's mesh brown in place (see scene_loader.py's
+        /mark_object_rotten -- mirrors RoboCasa's ChooseRipeFruit texture
+        hack). Call this only once the sim has revealed the outcome (e.g.
+        FruitShop's scale) so the recolor doesn't leak the answer early."""
+        request = MarkObjectRotten.Request()
+        request.object_name = object_name
+
+        response = self._call(
+            self._mark_rotten_cli, request, "/mark_object_rotten", self._step_timeout_sec
+        )
+        if not response.success:
+            raise RuntimeError(f"/mark_object_rotten failed: {response.message}")
+
+    def set_base_mode(self, enabled):
+        """Flip scene_loader's device.base_mode so subsequent step() calls'
+        base_dx/base_dy/base_dyaw actually move the mobile base instead of
+        being silently dropped (base and arm deltas are mutually exclusive
+        -- see _translate_delta_to_env_action). No-op if already in the
+        requested mode; StepAction has no toggle field, so this goes
+        through /set_delta_action instead (works fine outside teleop mode,
+        _set_delta_action_cb_impl has no control_mode guard)."""
+        if enabled == self._base_mode_on:
+            return
+        request = SetDeltaAction.Request()
+        request.toggle_base_mode = 1
+
+        response = self._call(
+            self._set_delta_cli, request, "/set_delta_action", self._step_timeout_sec
+        )
+        if not response.success:
+            raise RuntimeError(f"/set_delta_action (toggle_base_mode) failed: {response.message}")
+        self._base_mode_on = enabled
 
     def step(self, dx=0.0, dy=0.0, dz=0.0, droll=0.0, dpitch=0.0, dyaw=0.0,
              base_dx=0.0, base_dy=0.0, base_dyaw=0.0, grasp=0, next_arm=0, next_robot=0):

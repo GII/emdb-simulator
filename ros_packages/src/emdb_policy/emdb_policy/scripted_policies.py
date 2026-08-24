@@ -44,6 +44,54 @@ RELEASE_SETTLE_STEPS = 10
 BUTTON_APPROACH_THRESHOLD = 0.02  # meters, 3D distance (not just XY)
 ASK_NICELY_WAIT_STEPS = 30  # default idle duration for IdleMotion
 
+# Base-repositioning tunables (fruit_shop_bridge.py's _ensure_within_reach) --
+# no hard kinematic reach limit is documented anywhere in this repo or its
+# vendored deps; the only concrete number available is robosuite's own
+# UR5e._horizontal_radius=0.5 (a placement-clearance radius, not a true
+# reach spec -- real UR5e reach is ~0.85m), used here as a conservative
+# trigger with margin. FruitShop's accepted/rejected/scale can land at
+# opposite corners of a wide island (see fruit_shop_task.py's _get_obj_cfgs),
+# well outside this on some layouts.
+REACH_THRESHOLD = 0.45  # meters (planar); beyond this, reposition the base first
+BASE_STANDOFF_DISTANCE = 0.3  # meters short of the target to park the base
+BASE_ARRIVED_TOLERANCE = 0.05  # meters; considered "close enough", stop repositioning
+MAX_BASE_REPOSITION_STEPS = 150
+BASE_KP = 2.0
+BASE_MAX_DELTA = 0.05  # meters/step, matches OmronMobileBase's velocity-actuator scale
+
+
+def compute_base_delta(obs_dict, target_pos, standoff_distance=BASE_STANDOFF_DISTANCE,
+                        kp=BASE_KP, max_delta=BASE_MAX_DELTA):
+    """P-control step (base_dx, base_dy) driving the mobile base toward a
+    point standoff_distance short of target_pos (so it parks near, not on
+    top of, the target). Mirrors _FrameControlMixin._to_base_frame's
+    world-to-controller-frame rotation, but using robot_base_ori (the base
+    body's own world rotation, scene_loader.py's _augment_obs_with_control_frame)
+    instead of robot0_origin_ori (the arm controller's origin site) -- these
+    are two different frames on a mobile robot. Returns (base_dx, base_dy,
+    planar_distance_to_target) so the caller can decide when to stop.
+    """
+    base_pos = obs_dict["robot_base_pos"]
+    base_ori = obs_dict["robot_base_ori"].reshape(3, 3)
+
+    to_target = np.asarray(target_pos, dtype=np.float64)[:2] - base_pos[:2]
+    distance = float(np.linalg.norm(to_target))
+    if distance > 1e-6:
+        standoff_point = np.asarray(target_pos, dtype=np.float64)[:2] - to_target * (
+            standoff_distance / distance
+        )
+    else:
+        standoff_point = np.asarray(target_pos, dtype=np.float64)[:2]
+
+    world_err = np.array([standoff_point[0] - base_pos[0], standoff_point[1] - base_pos[1], 0.0])
+    # Same mirror_actions=True un-rotate _to_base_frame applies to arm
+    # deltas -- input2action() mirrors dx/dy before OSC/base control ever
+    # sees them, regardless of which body part the delta is routed to.
+    base_err = base_ori.T @ world_err
+    base_err = base_err * np.array([-1.0, -1.0, 1.0])
+    base_dx, base_dy = np.clip(base_err[:2] * kp, -max_delta, max_delta)
+    return float(base_dx), float(base_dy), distance
+
 
 class _FrameControlMixin:
     """World-frame-error -> base-frame-delta p-control, shared by every

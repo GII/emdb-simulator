@@ -10,8 +10,9 @@ mission of its own: success/reward for the real e-MDB experiment is computed
 by emdb_policy's fruit_shop_bridge.py (a port of the reference
 FruitShopSim's stage-gated reward logic, from the paper_experiment/src/
 emdb_develop workspace), not by robosuite's env. This task only needs to
-expose the physical scene (one fruit, one scale, a handful of fixed
-robot-relative target zones) that the bridge's scripted motions act on.
+expose the physical scene (one fruit, one scale, an accepted/rejected
+basket pair, and a handful of fixed robot-relative target zones) that the
+bridge's scripted motions act on.
 
 Only one fruit is ever physically instantiated at a time -- the reference
 FruitShopSim also only ever perceives/acts on the single closest fruit in
@@ -19,9 +20,13 @@ its internal inventory (see perceive_closest_fruit() in
 fruit_shop_sim_discrete.py), so there's no need for multiple simultaneous
 graspable fruit bodies here.
 """
+import os
+
 import numpy as np
 
+import robocasa.macros as robocasa_macros
 from robocasa.environments.kitchen.kitchen import *
+from robocasa.models.objects.kitchen_objects import OBJ_CATEGORIES
 
 
 class FruitShop(Kitchen):
@@ -34,57 +39,100 @@ class FruitShop(Kitchen):
     single-arm experiment yaml).
     """
 
-    # Provisional -- narrow this down with the empirical grasp trial
-    # described in the implementation plan (temporarily point
-    # KitchenLift.DEFAULT_OBJ_GROUPS at each candidate and watch
-    # /emdb/simulator/sensor/obj/grasped over a few episodes) before
-    # trusting this list. TwoFG7Gripper's jaw is small (~31mm nominal
-    # opening; see kitchen_lift_task.py), and static bbox math has already
-    # been shown unreliable as a predictor here (cube_object.py's own 5cm
-    # test cube exceeds that figure yet grasps fine), so only a real sim
-    # trial can confirm these.
-    DEFAULT_OBJ_GROUPS = ["lime", "kiwi", "cherry", "strawberry", "raspberry"]
+    # Confirmed via scripts/grasp_trial.py (emdb_simulator) against all 19
+    # RoboCasa "fruit"-typed categories plus lime: launches KitchenLift with
+    # each candidate (scene_loader's obj_groups param), drives
+    # PickAndLiftPolicy for 3 episodes, and requires BOTH a contact-based
+    # grasp (/emdb/simulator/sensor/obj/grasped) AND a completed 10cm lift
+    # (KitchenLift._check_success) -- the same bar kitchen_lift_task.py's own
+    # DEFAULT_OBJ_GROUPS comment used, since static bbox math was already
+    # shown unreliable there. Only these 6 passed both; apple/cantaloupe/
+    # cherry/coconut/kiwi got grasped but never completed a lift (dropped or
+    # slipped -- unreliable), and the rest (apricot, dates, grapes, lime,
+    # pineapple, pomegranate, raspberry, strawberry, watermelon) never got
+    # grasped at all by the ~31mm TwoFG7Gripper jaw. Notably the previous
+    # provisional list (lime/kiwi/cherry/strawberry/raspberry) passed none
+    # of these.
+    DEFAULT_OBJ_GROUPS = ["banana", "mango", "orange", "peach", "pear", "tangerine"]
+
+    # _setup_kitchen_references below requires an island (FixtureType.ISLAND)
+    # -- fail fast at construction time (mirrors KitchenLift's identical
+    # guard) rather than letting register_fixture_ref raise a more opaque
+    # error if ever instantiated with a non-island layout.
+    EXCLUDE_LAYOUTS = Kitchen.ISLAND_EXCLUDED_LAYOUTS
 
     # Fixed offsets (meters, world-frame axes) from the counter fixture's
     # own position -- never raw world constants, since RoboCasa kitchens are
     # procedurally laid out per episode/layout. Mirrors the reference sim's
     # fixed canonical zones (collection_area, weighing_area,
-    # accepted_fruit_pos, rejected_fruit_pos, fruit_left/right_side_pos in
-    # fruit_shop_sim_discrete.py), collapsed from that sim's polar
-    # (distance, angle) convention into offsets convenient for a real
-    # placement/fixture-relative frame. Tune by eye once a layout is picked.
+    # fruit_left/right_side_pos in fruit_shop_sim_discrete.py), collapsed
+    # from that sim's polar (distance, angle) convention into offsets
+    # convenient for a real placement/fixture-relative frame. Tune by eye
+    # once a layout is picked.
     COLLECTION_OFFSET = np.array([-0.25, -0.15, 0.0])
-    ACCEPTED_OFFSET = np.array([0.25, -0.35, 0.0])
-    REJECTED_OFFSET = np.array([-0.25, -0.35, 0.0])
     PLACED_OFFSET = np.array([0.0, -0.15, 0.0])
     BUTTON_OFFSET = np.array([0.35, -0.05, 0.05])
-    SCALE_OFFSET = np.array([0.0, -0.35, 0.0])
 
     # Read generically by scene_loader._augment_obs_with_control_frame and
     # published into obs_dict as "<name>" for each property listed here.
-    OBS_ZONE_ATTRS = ("collection_pos", "accepted_pos", "rejected_pos", "placed_pos", "button_pos")
+    OBS_ZONE_ATTRS = ("collection_pos", "placed_pos", "button_pos")
+
+    # Spawned objects whose live body position (not a fixed offset property)
+    # should be published into obs_dict as "<name>_pos" -- read generically
+    # by scene_loader._augment_obs_with_control_frame. accepted/rejected are
+    # the accept_fruit_policy/discard_fruit_policy drop targets (a basket
+    # pair standing in for accepted-fruit vs. discarded/"trash" fruit,
+    # RoboCasa has no dedicated trash-bin mesh) and must track wherever the
+    # placement sampler actually put them, not a fixed offset that might not
+    # line up with the mesh.
+    OBS_LIVE_OBJECT_ATTRS = ("scale", "accepted", "rejected")
+
+    # kitchen_objects.py's generic "basket" category mixes ordinary woven
+    # baskets with a couple of black wire-mesh variants that read visually
+    # as a trash bin -- confirmed by offscreen-rendering every variant in
+    # the category. "rejected" pins to these (see _basket_mjcf_path) so it
+    # always looks bin-like; "accepted" excludes them so it never does.
+    BASKET_TRASH_BIN_IDS = ("Basket027", "Basket044")
+
+    # Basket038 (a small single-handle woven purse/handbag shape, not a
+    # produce basket) is a poor fit for "accepted" specifically -- excluded
+    # in addition to BASKET_TRASH_BIN_IDS, not because it looks bin-like.
+    ACCEPTED_BASKET_EXCLUDE_IDS = BASKET_TRASH_BIN_IDS + ("Basket038",)
 
     def __init__(self, obj_groups=DEFAULT_OBJ_GROUPS, exclude_obj_groups=None, *args, **kwargs):
         self.obj_groups = obj_groups
         self.exclude_obj_groups = exclude_obj_groups
+        # Kitchen._load_model's fixture/object placement retry loop (misc/
+        # robocasa/robocasa/environments/kitchen/kitchen.py:643-834) already
+        # prints exactly which fixture/object PlacementError triggered each
+        # retry -- but only if macros.VERBOSE is True (default False, so
+        # retries -- e.g. an accepted/rejected basket instance too big for a
+        # given island's counter region -- fail silently up to 50 times
+        # before the generic "Ran _load_model() 50 times" RuntimeError).
+        # Flipping this here (not editing the vendored submodule) surfaces
+        # those per-attempt reasons in scene_loader's stdout. It's a
+        # process-global macro, so it stays on for the rest of the process
+        # once a FruitShop instance exists -- harmless (retry-path-only
+        # prints), same tradeoff RoboCasa's own macros module documents.
+        robocasa_macros.VERBOSE = True
         super().__init__(*args, **kwargs)
 
     def _setup_kitchen_references(self):
         super()._setup_kitchen_references()
-        self.counter = self.register_fixture_ref("counter", dict(id=FixtureType.COUNTER))
+        # FixtureType.COUNTER matches ANY non-corner counter (island or
+        # wall) and, with multiple matches, get_fixture() resolves via
+        # self.rng.choice() -- i.e. randomly, per episode. That would
+        # silently defeat scene_loader.py's FRUIT_SHOP_LAYOUT_IDS curation
+        # (picking island-containing layouts) by letting objects land on a
+        # wall counter instead. FixtureType.ISLAND is the distinct enum
+        # KitchenLift already relies on for the same reason (see
+        # kitchen_lift_task.py) -- don't "simplify" this back to COUNTER.
+        self.counter = self.register_fixture_ref("counter", dict(id=FixtureType.ISLAND))
         self.init_robot_base_ref = self.counter
 
     @property
     def collection_pos(self):
         return np.asarray(self.counter.pos, dtype=np.float64) + self.COLLECTION_OFFSET
-
-    @property
-    def accepted_pos(self):
-        return np.asarray(self.counter.pos, dtype=np.float64) + self.ACCEPTED_OFFSET
-
-    @property
-    def rejected_pos(self):
-        return np.asarray(self.counter.pos, dtype=np.float64) + self.REJECTED_OFFSET
 
     @property
     def placed_pos(self):
@@ -93,6 +141,25 @@ class FruitShop(Kitchen):
     @property
     def button_pos(self):
         return np.asarray(self.counter.pos, dtype=np.float64) + self.BUTTON_OFFSET
+
+    def _basket_mjcf_path(self, include_ids=None, exclude_ids=None):
+        """Pick one "basket" category model.xml path via self.rng, filtered
+        by folder id (e.g. "Basket027") -- object cfgs only support
+        exclude_obj_groups (whole categories, see EnvUtils.create_obj), not
+        excluding specific models within one, so this reproduces
+        sample_kitchen_object's exact-xml-path pinning
+        (kitchen_object_utils.py) manually over a filtered candidate list.
+        """
+        paths = []
+        for obj_cat in OBJ_CATEGORIES["basket"].values():
+            for path in obj_cat.mjcf_paths:
+                model_id = os.path.basename(os.path.dirname(path))
+                if include_ids is not None and model_id not in include_ids:
+                    continue
+                if exclude_ids is not None and model_id in exclude_ids:
+                    continue
+                paths.append(path)
+        return str(self.rng.choice(paths))
 
     def get_ep_meta(self):
         ep_meta = super().get_ep_meta()
@@ -127,6 +194,14 @@ class FruitShop(Kitchen):
                     fixture=self.counter,
                     size=(0.35, 0.25),
                     pos=(-1.0, -1.0),
+                    # Split islands (sink/cooktop strip cutting the top
+                    # surface into multiple geoms) would otherwise let any
+                    # of these 4 objects land in the strip's narrow segment.
+                    # full_depth_region drops that segment and keeps only
+                    # the full-depth one(s) -- see Counter.get_reset_regions
+                    # (misc/robocasa/robocasa/models/fixtures/counter.py:
+                    # 595-652). No-op on islands without a split.
+                    sample_region_kwargs=dict(full_depth_region=True),
                 ),
             )
         )
@@ -142,6 +217,58 @@ class FruitShop(Kitchen):
                     fixture=self.counter,
                     size=(0.3, 0.3),
                     pos=(1.0, -1.0),
+                    sample_region_kwargs=dict(full_depth_region=True),
+                ),
+            )
+        )
+        # accepted/rejected: a pair of real, non-graspable RoboCasa "basket"
+        # props that accept_fruit_policy/discard_fruit_policy drop the
+        # tested fruit into. Mirrors the "scale" prop above --
+        # OBS_LIVE_OBJECT_ATTRS tracks their live body position rather than
+        # a fixed offset, so the drop target always matches wherever the
+        # placement sampler put the mesh. obj_groups is pinned to a specific
+        # model.xml (not the bare "basket" category) so "rejected" always
+        # gets one of BASKET_TRASH_BIN_IDS's bin-like variants and
+        # "accepted" never does -- see _basket_mjcf_path.
+        #
+        # placement "size" here is only an upper cap, not a request: RoboCasa
+        # actually samples within min(outer_size, size) per axis
+        # (misc/robocasa/robocasa/utils/env_utils.py:_get_placement_initializer,
+        # ~line 1171), then further shrinks by the *sampled mesh's own real
+        # footprint* before checking min<=max (UniformRandomSampler._sample_x/
+        # _sample_y, misc/robocasa/robocasa/utils/placement_samplers.py:
+        # 225-265). So "size" must be >= the largest real candidate mesh's
+        # footprint, or that combination is *guaranteed* to raise "Invalid
+        # x/y range" regardless of how roomy the island is -- measured (via
+        # robocasa.macros.VERBOSE + the misc/robocasa kitchen.py debug patch)
+        # basket footprints run up to ~0.337m for accepted's pool and ~0.285m
+        # for rejected's (Basket027). A too-small "size" (an earlier version
+        # of this code tried 0.18/0.18 for "accepted" to fix crowding, which
+        # made this specific failure mode worse, not better) is the wrong
+        # lever for that; only "size" being too *big* relative to a narrow
+        # island's outer_size costs anything, and even then it's just
+        # silently clamped down, not an error.
+        cfgs.append(
+            dict(
+                name="accepted",
+                obj_groups=self._basket_mjcf_path(exclude_ids=self.ACCEPTED_BASKET_EXCLUDE_IDS),
+                placement=dict(
+                    fixture=self.counter,
+                    size=(0.36, 0.36),
+                    pos=(1.0, -0.3),
+                    sample_region_kwargs=dict(full_depth_region=True),
+                ),
+            )
+        )
+        cfgs.append(
+            dict(
+                name="rejected",
+                obj_groups=self._basket_mjcf_path(include_ids=self.BASKET_TRASH_BIN_IDS),
+                placement=dict(
+                    fixture=self.counter,
+                    size=(0.32, 0.32),
+                    pos=(-1.0, -0.3),
+                    sample_region_kwargs=dict(full_depth_region=True),
                 ),
             )
         )

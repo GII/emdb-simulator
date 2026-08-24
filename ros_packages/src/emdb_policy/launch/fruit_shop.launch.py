@@ -14,8 +14,13 @@ Doesn't launch the physics sim itself -- start that separately first, same
 two-invocation split lift_experiment.yaml's header documents ("A) sim ...
 B) arch: ros2 launch experiments lift_launch.py"):
 
-    ros2 run emdb_simulator scene_loader --ros-args -p control_mode:=rl -p task:=FruitShop -p perception_mode:=mdb
+    ros2 run emdb_simulator scene_loader --ros-args -p control_mode:=rl -p task:=FruitShop -p perception_mode:=mdb -p layout_id:=-1
     ros2 launch emdb_policy fruit_shop.launch.py
+
+layout_id:=-1 opts into scene_loader's FRUIT_SHOP_LAYOUT_IDS randomization
+(scene_loader.py) -- a curated set of island layouts, re-sampled every
+episode reset, instead of the node's generic layout_id default (12, a fixed
+single layout chosen for KitchenLift's needs).
 """
 from launch import LaunchDescription, LaunchContext
 from launch_ros.actions import Node

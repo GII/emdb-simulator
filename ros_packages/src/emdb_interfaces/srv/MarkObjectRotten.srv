@@ -1,0 +1,10 @@
+# emdb_interfaces/srv/MarkObjectRotten.srv
+# Recolors a named scene object's visual geoms brown in place (mirrors
+# RoboCasa's ChooseRipeFruit._update_fruit_texture(), generalized to any
+# object) -- for FruitShop, called once the scale decides a fruit is
+# rejected, so the fruit only visually "reveals" itself as rotten at that
+# moment, not before.
+string object_name
+---
+bool success
+string message

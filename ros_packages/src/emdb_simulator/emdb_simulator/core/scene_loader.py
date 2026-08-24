@@ -41,6 +41,7 @@ from emdb_interfaces.srv import (
     StepActionRaw,
     ResetEpisode,
     SaveDemos,
+    MarkObjectRotten,
 )
 from emdb_simulator.core import registered_robots  # noqa: F401  registers all custom robots
 from emdb_simulator.core import registered_tasks  # noqa: F401  registers all custom tasks
@@ -58,6 +59,15 @@ from emdb_interfaces.msg import (
     StepInfo,
 )
 
+# FruitShop's scene is entirely counter-based (fruit/scale/accepted/rejected
+# baskets, see fruit_shop_task.py), so unlike scene_loader's generic
+# layout_id=-1 (uniform over all 60 layouts, most without an island), it
+# specifically wants the extra counter surface a kitchen island provides.
+# Curated subset of layouts NOT in Kitchen.ISLAND_EXCLUDED_LAYOUTS
+# (robocasa/environments/kitchen/kitchen.py) -- randomized per episode in
+# _set_layout_style for scene diversity.
+FRUIT_SHOP_LAYOUT_IDS = (2, 4, 12, 21, 23)
+
 
 
 class SceneLoader(Node):
@@ -69,8 +79,8 @@ class SceneLoader(Node):
         # layout 12 has a kitchen island (layout 11, the previous default,
         # is in Kitchen.ISLAND_EXCLUDED_LAYOUTS and has none), which KitchenLift
         # needs since it spawns the robot and object on the island.
-        self.declare_parameter("layout_id", 12)
-        self.declare_parameter("style_id", 11)
+        self.declare_parameter("layout_id", -1)
+        self.declare_parameter("style_id", -1)
         self.declare_parameter("show_walls", False)
         self.declare_parameter("renderer", "mjviewer")
         # Skips the per-step self.env.render() call (the on-screen mjviewer
@@ -99,11 +109,22 @@ class SceneLoader(Node):
         self.declare_parameter("preview_camera_names", "all")
         self.declare_parameter("custom_cameras_file", "")
         self.declare_parameter("env_seed", -1)
+        # Empty (default) means "use whatever DEFAULT_OBJ_GROUPS the task class
+        # already has" -- comma-separated category names (e.g. "apple" or
+        # "apple,banana") override it per-run without editing task source, for
+        # tasks whose obj_groups is a constructor kwarg (KitchenLift, FruitShop).
+        self.declare_parameter("obj_groups", "")
 
         self.task = self.get_parameter("task").value
         self.robot = self.get_parameter("robot").value
         self.layout_id = int(self.get_parameter("layout_id").value)
         self.style_id = int(self.get_parameter("style_id").value)
+        obj_groups_param = self.get_parameter("obj_groups").value
+        self.obj_groups = (
+            [g.strip() for g in obj_groups_param.split(",") if g.strip()]
+            if obj_groups_param
+            else None
+        )
         self.show_walls = bool(self.get_parameter("show_walls").value)
         self.renderer = self.get_parameter("renderer").value
         self.headless = bool(self.get_parameter("headless").value)
@@ -288,6 +309,12 @@ class SceneLoader(Node):
             self._save_demos_cb,
         )
 
+        self.mark_object_rotten_srv = self.create_service(
+            MarkObjectRotten,
+            "/mark_object_rotten",
+            self._mark_object_rotten_cb,
+        )
+
         self._create_env()
         self._set_layout_style()
         self._init_robot_joint_mapping()
@@ -406,6 +433,8 @@ class SceneLoader(Node):
             config["layout_ids"] = [self.layout_id]
             config["style_ids"] = [self.style_id]
             config["seed"] = self.env_seed
+            if self.obj_groups is not None:
+                config["obj_groups"] = self.obj_groups
         if self.task == "KitchenLift":
             # custom_cameras is a KitchenLift-specific constructor kwarg (see
             # kitchen_lift_task.py); other Kitchen-family tasks don't accept it.
@@ -466,7 +495,10 @@ class SceneLoader(Node):
         style = self.style_id
 
         if layout == -1:
-            layout = int(np.random.choice(list(self.layouts.keys())))
+            if self.task == "FruitShop":
+                layout = int(np.random.choice(FRUIT_SHOP_LAYOUT_IDS))
+            else:
+                layout = int(np.random.choice(list(self.layouts.keys())))
         if style == -1:
             style = int(np.random.choice(list(self.styles.keys())))
 
@@ -689,30 +721,55 @@ class SceneLoader(Node):
         robot = self.env.robots[0]
         origin_ori = robot.part_controllers[robot.arms[0]].origin_ori
         obs_dict["robot0_origin_ori"] = np.asarray(origin_ori, dtype=np.float64).flatten()
-        obs_dict["robot_base_pos"] = np.asarray(robot.base_pos, dtype=np.float64)
+        # robot.base_pos/robot.base_ori (Robot.reset(), robosuite/robots/
+        # robot.py:274-275) are a ONE-TIME snapshot taken at env.reset() --
+        # never refreshed per control step, so they go stale the instant a
+        # mobile base actually moves (confirmed empirically: they read the
+        # spawn pose even after many base_dx steps). The live values come
+        # from robosuite's own mobile-base sensors instead (MobileRobot.
+        # _create_base_sensors, robosuite/robots/mobile_robot.py:301-317),
+        # which query the base's "center" site directly every call -- same
+        # site those sensors use, read the same way here rather than via
+        # the (possibly stale/unrefreshed) observable cache.
+        base_center_site = robot.robot_model.base.correct_naming("center")
+        base_site_id = self.env.sim.model.site_name2id(base_center_site)
+        obs_dict["robot_base_pos"] = np.asarray(
+            self.env.sim.data.site_xpos[base_site_id], dtype=np.float64
+        )
+        # 3x3 world-rotation matrix (mirrors robot0_origin_ori's convention)
+        # -- lets a policy client turn a world-frame position error into the
+        # mobile base's own forward/side control frame, the same way
+        # robot0_origin_ori does for the arm.
+        obs_dict["robot_base_ori"] = np.asarray(
+            self.env.sim.data.get_site_xmat(base_center_site), dtype=np.float64
+        ).flatten()
         dest = getattr(self.env, "dest", None)
         if dest is not None:
             obs_dict["dest_pos"] = np.asarray(dest.pos, dtype=np.float64)
 
         # Generic pass-through for any task-exposed "<name>_pos" property
-        # (e.g. FruitShop's collection_pos/accepted_pos/rejected_pos/
-        # placed_pos/button_pos, all computed fixture-relative since
-        # RoboCasa kitchens are procedurally laid out per episode) -- same
-        # role as dest_pos above, generalized so new tasks don't need their
-        # own scene_loader changes for fixed, fixture-relative target zones.
+        # (e.g. FruitShop's collection_pos/placed_pos/button_pos, all
+        # computed fixture-relative since RoboCasa kitchens are procedurally
+        # laid out per episode) -- same role as dest_pos above, generalized
+        # so new tasks don't need their own scene_loader changes for fixed,
+        # fixture-relative target zones.
         for zone_attr in getattr(self.env, "OBS_ZONE_ATTRS", ()):
             value = getattr(self.env, zone_attr, None)
             if value is not None:
                 obs_dict[zone_attr] = np.asarray(value, dtype=np.float64)
 
-        # scale_pos: unlike dest (a static Fixture with a cached .pos), the
-        # FruitShop "scale" is a spawned object -- its pose has to be read
-        # live from sim.data, not cached.
-        if "scale" in getattr(self.env, "objects", {}):
-            scale_body_id = self.env.obj_body_id["scale"]
-            obs_dict["scale_pos"] = np.asarray(
-                self.env.sim.data.body_xpos[scale_body_id], dtype=np.float64
-            )
+        # Generic pass-through for any task-exposed spawned object's live
+        # pose, published as "<name>_pos" (e.g. FruitShop's scale/accepted/
+        # rejected). Unlike dest/OBS_ZONE_ATTRS above (static Fixture/
+        # fixture-relative positions, cacheable), these are spawned objects
+        # whose pose has to be read live from sim.data every step -- there's
+        # no cached .pos to rely on.
+        for obj_name in getattr(self.env, "OBS_LIVE_OBJECT_ATTRS", ()):
+            if obj_name in getattr(self.env, "objects", {}):
+                body_id = self.env.obj_body_id[obj_name]
+                obs_dict[f"{obj_name}_pos"] = np.asarray(
+                    self.env.sim.data.body_xpos[body_id], dtype=np.float64
+                )
 
         return obs_dict
 
@@ -1055,6 +1112,37 @@ class SceneLoader(Node):
             response.success = False
             response.message = f"Failed to save demos: {e}"
             response.hdf5_path = ""
+
+        return response
+
+    def _mark_object_rotten_cb(self, request, response):
+        return self._run_on_sim_thread(lambda: self._mark_object_rotten_cb_impl(request, response))
+
+    def _mark_object_rotten_cb_impl(self, request, response):
+        # Brown recolor, mirroring RoboCasa's ChooseRipeFruit._update_fruit_texture()
+        # (misc/robocasa/robocasa/environments/kitchen/composite/making_juice/
+        # choose_ripe_fruit.py) -- direct in-place geom_rgba mutation, no
+        # separate "rotten" mesh/asset exists.
+        name = request.object_name
+        if self.env is None or name not in getattr(self.env, "objects", {}):
+            response.success = False
+            response.message = f"no object named {name!r} in the current scene"
+            return response
+
+        try:
+            obj = self.env.objects[name]
+            for geom in obj.visual_geoms:
+                geom_id = self.env.sim.model.geom_name2id(geom)
+                self.env.sim.model.geom_rgba[geom_id, :3] = (0.4, 0.26, 0.14)
+                prev_alpha = self.env.sim.model.geom_rgba[geom_id, 3]
+                self.env.sim.model.geom_rgba[geom_id, 3] = min(prev_alpha * 2, 1)
+            response.success = True
+            response.message = "ok"
+        except Exception as e:
+            self.get_logger().error(f"/mark_object_rotten failed: {e}")
+            self.get_logger().error(traceback.format_exc())
+            response.success = False
+            response.message = f"Failed to mark {name!r} rotten: {e}"
 
         return response
 
