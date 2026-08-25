@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """fruit_shop_bridge -- runs the real e-MDB Fruit Shop cognitive architecture
 (MainLoop + LTM, unmodified, from paper_experiment/src/emdb_develop) against
-TFM's own RoboCasa/robosuite physics simulator, with every one of the 8
-Fruit Shop policies implemented as a deterministic scripted motion (see
+TFM's own RoboCasa/robosuite physics simulator, with each of this single-arm
+adaptation's policies implemented as a deterministic scripted motion (see
 scripted_policies.py) instead of a learned/RL policy.
 
 The e-MDB architecture speaks its own control protocol (same shape
@@ -35,6 +35,10 @@ change list):
     can approach the scale from either side.
   * accept_fruit/discard_fruit's hand-specific catched-fruit fallback
     branches both check fruit_in_hand instead of a specific hand.
+  * press_button/button_light removed entirely (no button perception, no
+    press_button Policy node in the yaml) -- ApproachOnlyMotion's arm
+    control couldn't reliably complete the approach within
+    MAX_MOTION_STEPS even with the robot base already in reach.
 
 Known deviation: ask_nicely's mid-episode "restock" (the reference sim
 conjures new abstract fruit inventory out of nothing) has no physical
@@ -79,6 +83,7 @@ there is no separate "main_loop" process to launch by hand):
     ros2 run emdb_policy fruit_shop_bridge --ros-args -p config_file:=/home/fabian/Documents/TFM/mdb_experiments/fruit_shop_experiment.yaml
 """
 import os
+import traceback
 
 import numpy as np
 import yaml
@@ -101,12 +106,7 @@ from emdb_policy.agent_bridge import AgentBridge
 from emdb_policy.scripted_policies import (
     PickFruitMotion,
     TransportReleaseMotion,
-    ApproachOnlyMotion,
     IdleMotion,
-    compute_base_delta,
-    REACH_THRESHOLD,
-    MAX_BASE_REPOSITION_STEPS,
-    BASE_DIVERGENCE_MARGIN,
 )
 
 DIM_MIN = 0.03  # meters, matches fruit_shop_sim_discrete.py's generate_fruits()
@@ -154,13 +154,20 @@ class FruitShopBridge(Node):
         self.catched_fruit = None
         self.tested_fruit = None
         self.fruit_in_hand = False
-        self.button_light = False
         self.scale_state = 0  # 0 untested, 1 good, 2 bad
         self.scale_active = False
         self.fruit_correctly_accepted = False
         self.fruit_correctly_rejected = False
         self.classify_fruit_reward = 0.0
         self.place_fruit_reward = 0.0
+        # Set by _resolve_tested_fruit/_release_held_fruit when the fruit
+        # just got physically dropped into accepted/rejected -- checked
+        # (and cleared) by executed_policy_callback *after* it computes
+        # this cycle's reward/perceptions, not reset_world() immediately
+        # here, so reward_classify_fruit_goal() still gets one chance to
+        # read fruit_correctly_accepted/rejected before reset_world()
+        # zeroes them back out for the next episode.
+        self._pending_world_reset = False
 
         # --- physics-facing client ------------------------------------
         self._last_obs = None
@@ -171,7 +178,6 @@ class FruitShopBridge(Node):
         # --- perception publishers (fixed, fruit-shop-specific topics) -
         self.fruits_pub = self.create_publisher(FruitListMsg, "/emdb/simulator/sensor/fruits", 10)
         self.scales_pub = self.create_publisher(ScaleListMsg, "/emdb/simulator/sensor/scales", 10)
-        self.button_light_pub = self.create_publisher(Bool, "/emdb/simulator/sensor/button_light", 10)
         self.fruit_in_hand_pub = self.create_publisher(Bool, "/emdb/simulator/sensor/fruit_in_hand", 10)
         self.classify_fruit_pub = self.create_publisher(Float32, "/emdb/simulator/sensor/classify_fruit", 10)
         self.place_fruit_pub = self.create_publisher(Float32, "/emdb/simulator/sensor/place_fruit", 10)
@@ -250,16 +256,46 @@ class FruitShopBridge(Node):
             self.get_logger().error(f"Unknown policy {request.policy!r}")
             response.success = False
             return response
-        success = method()
+        try:
+            success = method()
+        except Exception as e:
+            # A policy failing unexpectedly (e.g. an AgentBridge service
+            # call raising because the sim rejected a request) used to
+            # propagate straight out of this service callback and kill the
+            # whole node -- rclpy has no default recovery for an exception
+            # raised inside a service handler, so the entire
+            # fruit_shop_bridge process died mid-episode, taking the rest
+            # of the launched system down with it. Reset the episode
+            # instead: this is already the recovery path for a bad/
+            # unreachable procedurally-generated layout (world_reset_callback/
+            # control_callback's "reset_world" command use the same
+            # reset_world()), so it's a graceful way to shed a bad episode
+            # rather than crashing the process.
+            self.get_logger().error(f"Policy {request.policy!r} failed unexpectedly: {e}")
+            self.get_logger().error(traceback.format_exc())
+            self.reset_world()
+            response.success = False
+            return response
         self.perceive_closest_fruit()
         self.update_reward_sensor()
         self.publish_perceptions()
+        if self._pending_world_reset:
+            # Deferred from _resolve_tested_fruit/_release_held_fruit (the
+            # fruit was just physically dropped into accepted or rejected)
+            # until after the update_reward_sensor()/publish_perceptions()
+            # above -- reset_world() itself zeroes fruit_correctly_accepted/
+            # rejected as its first step, so resetting any earlier would
+            # wipe that flag before reward_classify_fruit_goal() ever got a
+            # chance to read it as a successful classification.
+            self._pending_world_reset = False
+            self.reset_world()
         response.success = bool(success)
         return response
 
     # ------------------------------------------------ world / perception
     def reset_world(self):
         self.get_logger().info("Resetting FruitShop world...")
+        self._pending_world_reset = False
         self.fruit_correctly_accepted = False
         self.fruit_correctly_rejected = False
         self._last_obs = self.agent_bridge.reset()
@@ -270,7 +306,6 @@ class FruitShopBridge(Node):
         self.scale_active = False
         self.fruit_available = bool(self.rng.uniform() > 0.5)
         self.fruit_dim_max = float(self.rng.uniform(DIM_MIN, DIM_MAX))
-        self.button_light = bool(self.rng.uniform() > 0.5)
         self.perceive_closest_fruit()
         self.update_reward_sensor()
         self.publish_perceptions()
@@ -338,7 +373,6 @@ class FruitShopBridge(Node):
         scale_entry.active = bool(self.scale_active)
         self.scales_pub.publish(ScaleListMsg(data=[scale_entry]))
 
-        self.button_light_pub.publish(Bool(data=bool(self.button_light)))
         self.fruit_in_hand_pub.publish(Bool(data=bool(self.fruit_in_hand)))
         self.classify_fruit_pub.publish(Float32(data=float(self.classify_fruit_reward)))
         self.place_fruit_pub.publish(Float32(data=float(self.place_fruit_reward)))
@@ -348,21 +382,9 @@ class FruitShopBridge(Node):
         """Drive `motion` to its DONE state via AgentBridge.step_vector(),
         updating self._last_obs as it goes. Returns True if the motion
         reached STATE_DONE within max_steps, False on timeout/termination --
-        a real physical failure (e.g. a missed grasp), unlike the reference
-        sim where every policy call always succeeds.
-
-        Repositions the base first if motion's target is out of arm reach
-        (see _ensure_within_reach) -- accepted/rejected/scale can land at
-        opposite corners of a wide island (fruit_shop_task.py's
-        _get_obj_cfgs), well beyond the UR5e's reach from wherever the
-        robot spawned (tied to the fruit's own placement, not the island
-        center)."""
-        target_pos_key = getattr(motion, "TARGET_POS_KEY", None) or getattr(
-            motion, "OBJ_POS_KEY", None
-        )
-        if target_pos_key is not None:
-            self._ensure_within_reach(target_pos_key)
-
+        a real physical failure (e.g. a missed grasp or a target out of
+        arm reach), unlike the reference sim where every policy call
+        always succeeds."""
         for _ in range(max_steps):
             action = motion.policy_fn(self._last_obs, self.rng)
             obs, _reward, terminated, truncated, _info = self.agent_bridge.step_vector(action)
@@ -372,60 +394,6 @@ class FruitShopBridge(Node):
             if terminated or truncated:
                 return False
         return False
-
-    def _ensure_within_reach(self, target_pos_key):
-        """If target_pos_key is farther than REACH_THRESHOLD (planar) from
-        the robot's current base position, drive the mobile base closer
-        before letting the caller's arm motion run. No-op (fast) when
-        already in reach, which is the common case -- most layouts don't
-        need this at all."""
-        target_pos = self._last_obs.get(target_pos_key)
-        base_pos = self._last_obs.get("robot_base_pos")
-        if target_pos is None or base_pos is None:
-            return
-        start_distance = float(np.linalg.norm(target_pos[:2] - base_pos[:2]))
-        if start_distance <= REACH_THRESHOLD:
-            return
-
-        self.get_logger().info(
-            f"{target_pos_key} is {start_distance:.2f}m away (> {REACH_THRESHOLD}m reach) "
-            "-- repositioning base"
-        )
-        self.agent_bridge.set_base_mode(True)
-        try:
-            # compute_base_delta drives toward a point BASE_STANDOFF_DISTANCE
-            # short of target_pos, but this loop's own goal is narrower --
-            # just get back within arm reach, not necessarily all the way to
-            # the standoff point (BASE_STANDOFF_DISTANCE < REACH_THRESHOLD,
-            # so this stops sooner, saving real repositioning time -- the
-            # actual per-step progress is much slower/burstier than
-            # BASE_MAX_DELTA alone would suggest, see MAX_BASE_REPOSITION_STEPS).
-            steps_taken = 0
-            best_distance = start_distance
-            for _ in range(MAX_BASE_REPOSITION_STEPS):
-                target_pos = self._last_obs[target_pos_key]
-                base_dx, base_dy, distance = compute_base_delta(self._last_obs, target_pos)
-                if distance <= REACH_THRESHOLD:
-                    break
-                best_distance = min(best_distance, distance)
-                if distance > best_distance + BASE_DIVERGENCE_MARGIN:
-                    self.get_logger().warning(
-                        f"base repositioning toward {target_pos_key} is diverging "
-                        f"(best={best_distance:.2f}m, now={distance:.2f}m) -- giving up early"
-                    )
-                    break
-                obs, _reward, terminated, truncated, _info = self.agent_bridge.step(
-                    base_dx=base_dx, base_dy=base_dy
-                )
-                self._last_obs = obs
-                steps_taken += 1
-                if terminated or truncated:
-                    break
-            self.get_logger().info(
-                f"base repositioned in {steps_taken} steps, now {distance:.2f}m from {target_pos_key}"
-            )
-        finally:
-            self.agent_bridge.set_base_mode(False)
 
     # ------------------------------------------------ policy implementations
     # Each ports its FruitShopSim counterpart's decision logic (when to act,
@@ -467,14 +435,24 @@ class FruitShopBridge(Node):
         success = self._run_motion(motion)
         if success:
             self.fruit_in_hand = False
-            if self.iteration > self.change_reward_iterations.get("stage1", float("inf")):
-                self.scale_active = True
-                if self.scale_state == 0:
-                    self.scale_state = 1 if self.rng.uniform() > 0.5 else 2
-                    if self.scale_state == 2:
-                        # Reveal "rotten" only now -- the scale is what tells
-                        # us it's bad, not a look at the fruit beforehand.
-                        self.agent_bridge.mark_object_rotten("fruit")
+            # Always determine and reveal the fruit's real state (1 good /
+            # 2 rotten) once it's physically been placed on the scale --
+            # this is a perception fact (the scale's own sensor reading of
+            # the fruit sitting on it, publish_perceptions's scale_entry.
+            # state, normalized downstream by FruitShopPerception's
+            # n_states: 3), not itself a reward, so it shouldn't be gated
+            # behind change_reward_iterations['stage1'] the way
+            # reward_place_fruit_goal's leniency is. That stage1 check
+            # used to leave scale_state stuck at 0 ("unknown") for the
+            # entire curriculum's early iterations even though the fruit
+            # was already sitting on the scale.
+            self.scale_active = True
+            if self.scale_state == 0:
+                self.scale_state = 1 if self.rng.uniform() > 0.5 else 2
+                if self.scale_state == 2:
+                    # Reveal "rotten" only now -- the scale is what tells
+                    # us it's bad, not a look at the fruit beforehand.
+                    self.agent_bridge.mark_object_rotten("fruit")
             self.tested_fruit = self.catched_fruit
             self.catched_fruit = None
         return success
@@ -512,6 +490,7 @@ class FruitShopBridge(Node):
             self.scale_active = False
             self.tested_fruit = None
             self.fruit_available = False  # resolved -- out of play until ask_nicely
+            self._pending_world_reset = True
         return success
 
     def _release_held_fruit(self, target_pos_key):
@@ -525,14 +504,7 @@ class FruitShopBridge(Node):
             self.fruit_in_hand = False
             self.catched_fruit = None
             self.fruit_available = False
-        return success
-
-    def press_button_policy(self):
-        motion = ApproachOnlyMotion()
-        motion.on_episode_start(gripper_closed=self.fruit_in_hand)
-        success = self._run_motion(motion)
-        if success:
-            self.button_light = not self.button_light
+            self._pending_world_reset = True
         return success
 
     def ask_nicely_policy(self):

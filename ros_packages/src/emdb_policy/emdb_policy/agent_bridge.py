@@ -20,7 +20,6 @@ from emdb_interfaces.msg import Observation, StepInfo
 from emdb_interfaces.srv import (
     MarkObjectRotten,
     ResetEpisode,
-    SetDeltaAction,
     StepAction,
     StepActionRaw,
 )
@@ -30,8 +29,16 @@ def observation_to_dict(msg: Observation):
     """Rebuild a RoboCasa/robosuite-style obs_dict from a flattened Observation."""
     obs = OrderedDict()
     for entry in msg.entries:
-        shape = tuple(entry.shape) if len(entry.shape) > 0 else (len(entry.data),)
-        obs[entry.key] = np.array(entry.data, dtype=np.float64).reshape(shape)
+        # scene_loader's _publish_observation (the only producer) always
+        # sets entry.shape accurately from the source array's own .shape,
+        # including an empty list for a true scalar (0-d) value -- trust
+        # it directly instead of falling back to (len(entry.data),), which
+        # silently turns any scalar entry back into a shape-(1,) array
+        # instead of a real scalar (confirmed live: broke arithmetic on a
+        # scalar "<name>_top_z" entry, e.g. `np.array([x, y, top_z_plus])`
+        # raising "inhomogeneous shape" because top_z_plus was a (1,)
+        # array, not a float).
+        obs[entry.key] = np.array(entry.data, dtype=np.float64).reshape(tuple(entry.shape))
     return obs
 
 
@@ -51,13 +58,6 @@ class AgentBridge(Node):
         self._gripper_closed = False
         self._executor = None
         self._spin_thread = None
-        # /set_delta_action's toggle_base_mode is the only way to flip
-        # scene_loader's shared device.base_mode flag (StepAction has no
-        # such field) -- but _set_delta_action_cb_impl has no control_mode
-        # guard, so it works fine alongside control_mode:=rl. Tracked here
-        # so set_base_mode() only sends a toggle when the mode is actually
-        # changing (it's a toggle, not a set).
-        self._base_mode_on = False
 
         self.create_subscription(Observation, "/observations", self._on_observation, 10)
         self.create_subscription(StepInfo, "/reward", self._on_step_info, 10)
@@ -66,7 +66,6 @@ class AgentBridge(Node):
         self._step_raw_cli = self.create_client(StepActionRaw, "/step_action_raw")
         self._reset_cli = self.create_client(ResetEpisode, "/reset_episode")
         self._mark_rotten_cli = self.create_client(MarkObjectRotten, "/mark_object_rotten")
-        self._set_delta_cli = self.create_client(SetDeltaAction, "/set_delta_action")
 
     def start(self):
         """Spin this node on a background thread so blocking step()/reset() calls work."""
@@ -86,7 +85,6 @@ class AgentBridge(Node):
             (self._step_raw_cli, "/step_action_raw"),
             (self._reset_cli, "/reset_episode"),
             (self._mark_rotten_cli, "/mark_object_rotten"),
-            (self._set_delta_cli, "/set_delta_action"),
         )
         for cli, name in clients:
             if not cli.wait_for_service(timeout_sec=timeout_sec):
@@ -167,26 +165,6 @@ class AgentBridge(Node):
         )
         if not response.success:
             raise RuntimeError(f"/mark_object_rotten failed: {response.message}")
-
-    def set_base_mode(self, enabled):
-        """Flip scene_loader's device.base_mode so subsequent step() calls'
-        base_dx/base_dy/base_dyaw actually move the mobile base instead of
-        being silently dropped (base and arm deltas are mutually exclusive
-        -- see _translate_delta_to_env_action). No-op if already in the
-        requested mode; StepAction has no toggle field, so this goes
-        through /set_delta_action instead (works fine outside teleop mode,
-        _set_delta_action_cb_impl has no control_mode guard)."""
-        if enabled == self._base_mode_on:
-            return
-        request = SetDeltaAction.Request()
-        request.toggle_base_mode = 1
-
-        response = self._call(
-            self._set_delta_cli, request, "/set_delta_action", self._step_timeout_sec
-        )
-        if not response.success:
-            raise RuntimeError(f"/set_delta_action (toggle_base_mode) failed: {response.message}")
-        self._base_mode_on = enabled
 
     def step(self, dx=0.0, dy=0.0, dz=0.0, droll=0.0, dpitch=0.0, dyaw=0.0,
              base_dx=0.0, base_dy=0.0, base_dyaw=0.0, grasp=0, next_arm=0, next_robot=0):

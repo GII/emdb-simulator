@@ -40,75 +40,11 @@ GRASP_SETTLE_STEPS = 15  # gripper closes at speed=0.2/step (gripper_loader.py)
 LIFT_HEIGHT = 0.12  # meters to raise above the grasp height
 PLACE_HOVER_HEIGHT = 0.15  # meters above dest_pos to transport at
 PLACE_LOWER_OFFSET = 0.05  # meters above dest_pos to lower to before releasing
+# meters above a container's rim (TransportReleaseMotion's "<name>_top_z")
+# to release into it, when the target has one -- see _container_top_z.
+CONTAINER_RIM_CLEARANCE = 0.05
 RELEASE_SETTLE_STEPS = 10
-BUTTON_APPROACH_THRESHOLD = 0.02  # meters, 3D distance (not just XY)
 ASK_NICELY_WAIT_STEPS = 30  # default idle duration for IdleMotion
-
-# Base-repositioning tunables (fruit_shop_bridge.py's _ensure_within_reach) --
-# no hard kinematic reach limit is documented anywhere in this repo or its
-# vendored deps; the only concrete number available is robosuite's own
-# UR5e._horizontal_radius=0.5 (a placement-clearance radius, not a true
-# reach spec -- real UR5e reach is ~0.85m), used here as a conservative
-# trigger with margin. FruitShop's accepted/rejected/scale can land at
-# opposite corners of a wide island (see fruit_shop_task.py's _get_obj_cfgs),
-# well outside this on some layouts.
-REACH_THRESHOLD = 0.45  # meters (planar); beyond this, reposition the base first
-BASE_STANDOFF_DISTANCE = 0.3  # meters short of the target to park the base
-BASE_ARRIVED_TOLERANCE = 0.05  # meters; considered "close enough", stop repositioning
-# OmronMobileBase's velocity actuator shows real stiction-like behavior in
-# practice (empirically traced via a live scene: many consecutive steps at a
-# constant commanded base_dx/base_dy produce near-zero actual displacement,
-# interspersed with bursts of real movement) -- true achieved progress can
-# run 5-10x slower than BASE_MAX_DELTA per step would suggest, not a steady
-# rate. MAX_BASE_REPOSITION_STEPS is budgeted generously (not just
-# distance/BASE_MAX_DELTA) to tolerate that.
-MAX_BASE_REPOSITION_STEPS = 500
-BASE_KP = 2.0
-BASE_MAX_DELTA = 0.05  # meters/step, matches OmronMobileBase's velocity-actuator scale
-# Empirically (live-scene testing), the P-control direction isn't reliably
-# stable for every base orientation/target geometry -- one traced case
-# consistently walked AWAY from a target it started only 0.62m from,
-# growing to 0.83m over a full 500-step budget instead of converging.
-# Root cause not fully isolated (suspected: robot_base_ori sampled once per
-# step while the base is still physically settling from the previous
-# command, compounding into a bad heading estimate for some geometries).
-# Until that's root-caused, bail out early if distance clearly grows past
-# the best point reached, rather than blindly spending the whole budget
-# walking further from the target.
-BASE_DIVERGENCE_MARGIN = 0.15  # meters worse than the best distance seen -> give up
-
-
-def compute_base_delta(obs_dict, target_pos, standoff_distance=BASE_STANDOFF_DISTANCE,
-                        kp=BASE_KP, max_delta=BASE_MAX_DELTA):
-    """P-control step (base_dx, base_dy) driving the mobile base toward a
-    point standoff_distance short of target_pos (so it parks near, not on
-    top of, the target). Mirrors _FrameControlMixin._to_base_frame's
-    world-to-controller-frame rotation, but using robot_base_ori (the base
-    body's own world rotation, scene_loader.py's _augment_obs_with_control_frame)
-    instead of robot0_origin_ori (the arm controller's origin site) -- these
-    are two different frames on a mobile robot. Returns (base_dx, base_dy,
-    planar_distance_to_target) so the caller can decide when to stop.
-    """
-    base_pos = obs_dict["robot_base_pos"]
-    base_ori = obs_dict["robot_base_ori"].reshape(3, 3)
-
-    to_target = np.asarray(target_pos, dtype=np.float64)[:2] - base_pos[:2]
-    distance = float(np.linalg.norm(to_target))
-    if distance > 1e-6:
-        standoff_point = np.asarray(target_pos, dtype=np.float64)[:2] - to_target * (
-            standoff_distance / distance
-        )
-    else:
-        standoff_point = np.asarray(target_pos, dtype=np.float64)[:2]
-
-    world_err = np.array([standoff_point[0] - base_pos[0], standoff_point[1] - base_pos[1], 0.0])
-    # Same mirror_actions=True un-rotate _to_base_frame applies to arm
-    # deltas -- input2action() mirrors dx/dy before OSC/base control ever
-    # sees them, regardless of which body part the delta is routed to.
-    base_err = base_ori.T @ world_err
-    base_err = base_err * np.array([-1.0, -1.0, 1.0])
-    base_dx, base_dy = np.clip(base_err[:2] * kp, -max_delta, max_delta)
-    return float(base_dx), float(base_dy), distance
 
 
 class _FrameControlMixin:
@@ -287,21 +223,54 @@ class TransportReleaseMotion(_FrameControlMixin):
         del rng
         return self._step(obs_dict)
 
+    def _container_top_z(self, obs_dict):
+        # scene_loader publishes "<name>_top_z" alongside "<name>_pos" for
+        # every OBS_LIVE_OBJECT_ATTRS object (SceneLoader._augment_obs_with_
+        # control_frame) -- None for target keys with no backing object
+        # (e.g. "placed_pos", an abstract drop zone), which is exactly when
+        # there's nothing to clear and the old PLACE_HOVER_HEIGHT/
+        # PLACE_LOWER_OFFSET-only behavior below is already correct.
+        if not self.TARGET_POS_KEY.endswith("_pos"):
+            return None
+        top_z = obs_dict.get(self.TARGET_POS_KEY[: -len("_pos")] + "_top_z")
+        # obs_dict values normally arrive as arrays (even 0-d/1-element
+        # ones for a scalar observation, depending on how the ROS message
+        # round-trip reshapes it) -- force a plain float so the max()
+        # comparisons below can't end up building a ragged array out of a
+        # stray non-scalar element.
+        return None if top_z is None else float(top_z)
+
     def _step(self, obs_dict):
         eef_pos = obs_dict["robot0_eef_pos"]
         target_pos = obs_dict[self.TARGET_POS_KEY]
+        top_z = self._container_top_z(obs_dict)
         action6 = np.zeros(6)
         gripper_cmd = 1.0
 
         if self.state == self.STATE_TRANSPORT:
-            target = target_pos + np.array([0, 0, PLACE_HOVER_HEIGHT])
+            # Some basket variants (accepted/rejected) are tall enough that
+            # target_pos[2] + PLACE_HOVER_HEIGHT alone can still be below
+            # the rim -- clear top_z too, not just the object's own body
+            # origin, or the transport approach drives the held fruit
+            # straight into the basket wall instead of over it.
+            hover_z = target_pos[2] + PLACE_HOVER_HEIGHT
+            if top_z is not None:
+                hover_z = max(hover_z, top_z + PLACE_HOVER_HEIGHT)
+            target = np.array([target_pos[0], target_pos[1], hover_z])
             err = target - eef_pos
             action6[:3] = self._p_control(err, obs_dict)
             if np.linalg.norm(err[:2]) < XY_APPROACH_THRESHOLD and abs(err[2]) < 0.03:
                 self.state = self.STATE_LOWER
 
         elif self.state == self.STATE_LOWER:
-            target = target_pos + np.array([0, 0, PLACE_LOWER_OFFSET])
+            # Release just above the rim (not down at target_pos's own
+            # body-origin height, which for a tall basket can be well
+            # below it) so the fruit drops cleanly in instead of the
+            # gripper trying to descend into solid basket wall.
+            lower_z = target_pos[2] + PLACE_LOWER_OFFSET
+            if top_z is not None:
+                lower_z = max(lower_z, top_z + CONTAINER_RIM_CLEARANCE)
+            target = np.array([target_pos[0], target_pos[1], lower_z])
             err = target - eef_pos
             action6[:3] = self._p_control(err, obs_dict)
             if np.linalg.norm(err) < Z_DESCEND_THRESHOLD:
@@ -318,46 +287,6 @@ class TransportReleaseMotion(_FrameControlMixin):
             gripper_cmd = -1.0
 
         return np.concatenate([action6, [gripper_cmd]])
-
-
-class ApproachOnlyMotion(_FrameControlMixin):
-    """Move the eef to TARGET_POS_KEY and hold; no grasp change.
-
-    Used for press_button: the arm just has to reach a fixed point, nothing
-    is picked up or released. gripper_closed reflects whatever the caller
-    is currently holding (or not) so this doesn't accidentally open/close
-    on an unrelated object mid-approach.
-    """
-
-    TARGET_POS_KEY = "button_pos"
-
-    STATE_APPROACH = "APPROACH"
-    STATE_DONE = "DONE"
-
-    def __init__(self, target_pos_key=None):
-        if target_pos_key is not None:
-            self.TARGET_POS_KEY = target_pos_key
-
-    def on_episode_start(self, gripper_closed=False):
-        self.state = self.STATE_APPROACH
-        self._gripper_cmd = 1.0 if gripper_closed else -1.0
-
-    def policy_fn(self, obs_dict, rng):
-        del rng
-        return self._step(obs_dict)
-
-    def _step(self, obs_dict):
-        eef_pos = obs_dict["robot0_eef_pos"]
-        target_pos = obs_dict[self.TARGET_POS_KEY]
-        action6 = np.zeros(6)
-
-        if self.state == self.STATE_APPROACH:
-            err = target_pos - eef_pos
-            action6[:3] = self._p_control(err, obs_dict)
-            if np.linalg.norm(err) < BUTTON_APPROACH_THRESHOLD:
-                self.state = self.STATE_DONE
-
-        return np.concatenate([action6, [self._gripper_cmd]])
 
 
 class IdleMotion:

@@ -34,9 +34,11 @@ class FruitShop(Kitchen):
 
     A single UR5e+2FG7 arm plays every role the two-hand reference
     experiment splits across hands: pick_fruit, place_fruit, test_fruit,
-    accept_fruit, discard_fruit, press_button, ask_nicely (change_hands has
-    no single-arm equivalent and is dropped, matching the adapted
-    single-arm experiment yaml).
+    accept_fruit, discard_fruit, ask_nicely (change_hands has no
+    single-arm equivalent and is dropped; press_button/button_light were
+    also dropped -- ApproachOnlyMotion's arm control couldn't reliably
+    complete the approach -- matching the adapted single-arm experiment
+    yaml).
     """
 
     # Confirmed via scripts/grasp_trial.py (emdb_simulator) against all 19
@@ -53,7 +55,7 @@ class FruitShop(Kitchen):
     # grasped at all by the ~31mm TwoFG7Gripper jaw. Notably the previous
     # provisional list (lime/kiwi/cherry/strawberry/raspberry) passed none
     # of these.
-    DEFAULT_OBJ_GROUPS = ["banana", "mango", "orange", "peach", "pear", "tangerine"]
+    DEFAULT_OBJ_GROUPS = ["apple", "mango", "orange", "peach", "pear", "tangerine"]
 
     # _setup_kitchen_references below requires an island (FixtureType.ISLAND)
     # -- fail fast at construction time (mirrors KitchenLift's identical
@@ -71,11 +73,10 @@ class FruitShop(Kitchen):
     # once a layout is picked.
     COLLECTION_OFFSET = np.array([-0.25, -0.15, 0.0])
     PLACED_OFFSET = np.array([0.0, -0.15, 0.0])
-    BUTTON_OFFSET = np.array([0.35, -0.05, 0.05])
 
     # Read generically by scene_loader._augment_obs_with_control_frame and
     # published into obs_dict as "<name>" for each property listed here.
-    OBS_ZONE_ATTRS = ("collection_pos", "placed_pos", "button_pos")
+    OBS_ZONE_ATTRS = ("collection_pos", "placed_pos")
 
     # Spawned objects whose live body position (not a fixed offset property)
     # should be published into obs_dict as "<name>_pos" -- read generically
@@ -130,17 +131,32 @@ class FruitShop(Kitchen):
         self.counter = self.register_fixture_ref("counter", dict(id=FixtureType.ISLAND))
         self.init_robot_base_ref = self.counter
 
+    def _robot_base_pos(self):
+        base_center_site = self.robots[0].robot_model.base.correct_naming("center")
+        return np.asarray(
+            self.sim.data.site_xpos[self.sim.model.site_name2id(base_center_site)],
+            dtype=np.float64,
+        )
+
     @property
     def collection_pos(self):
-        return np.asarray(self.counter.pos, dtype=np.float64) + self.COLLECTION_OFFSET
+        # Relative to the robot's own *live* base position, not
+        # self.counter.pos -- the counter fixture's own reference point can
+        # be a meter or more from wherever the fruit/scale/accepted/rejected
+        # cluster and robot spawn actually landed on a large island (its
+        # local origin isn't necessarily anywhere near whichever full-depth
+        # region/corner _get_obj_cfgs' placement sampler picked). There is
+        # no base or object repositioning in this sim (removed -- too
+        # unreliable, see fruit_shop_bridge.py's git history), so
+        # everything the robot needs to reach has to already be
+        # guaranteed close by construction; tying this to the base
+        # directly means it's always in reach without needing any
+        # runtime correction.
+        return self._robot_base_pos() + self.COLLECTION_OFFSET
 
     @property
     def placed_pos(self):
-        return np.asarray(self.counter.pos, dtype=np.float64) + self.PLACED_OFFSET
-
-    @property
-    def button_pos(self):
-        return np.asarray(self.counter.pos, dtype=np.float64) + self.BUTTON_OFFSET
+        return self._robot_base_pos() + self.PLACED_OFFSET
 
     def _basket_mjcf_path(self, include_ids=None, exclude_ids=None):
         """Pick one "basket" category model.xml path via self.rng, filtered
@@ -193,7 +209,20 @@ class FruitShop(Kitchen):
                 placement=dict(
                     fixture=self.counter,
                     size=(0.35, 0.25),
-                    pos=(-1.0, -1.0),
+                    # pos=(0, 0) + a fixed-meters "offset" (not a normalized
+                    # pos toward a corner) -- offset lands in intra_offset
+                    # un-scaled by outer_size (misc/robocasa/robocasa/utils/
+                    # env_utils.py:_get_placement_initializer, ~line 1237),
+                    # so this corner of the cluster below sits a *constant*
+                    # 0.2m/0.2m from the region center regardless of how big
+                    # the sampled region actually is -- normalized pos can't
+                    # give that guarantee since the same pos value maps to
+                    # wildly different real distances per layout (measured,
+                    # island full-depth-region "size" ranges from ~0.92m to
+                    # ~3.75m across FRUIT_SHOP_LAYOUT_IDS -- see the cluster
+                    # comment below).
+                    pos=(0.0, 0.0),
+                    offset=(-0.2, -0.2),
                     # Split islands (sink/cooktop strip cutting the top
                     # surface into multiple geoms) would otherwise let any
                     # of these 4 objects land in the strip's narrow segment.
@@ -209,15 +238,51 @@ class FruitShop(Kitchen):
         # WeighIngredients in misc/robocasa/robocasa/environments/kitchen/
         # composite/measuring_ingredients/weigh_ingredients.py for the
         # precedent this mirrors) used as the physical "scale" surface.
+        #
+        # ref_obj="fruit" pins scale/accepted/rejected (below) to reuse
+        # "fruit"'s own already-sampled reset_region instead of each
+        # independently calling Fixture.sample_reset_region() (misc/
+        # robocasa/robocasa/models/fixtures/fixture.py:330-383, ends in
+        # self.rng.choice(valid_regions)) -- on an island with more than one
+        # valid top region (e.g. a sink/cooktop strip splitting it), that
+        # let each of the 4 objects land on a *different* region/corner
+        # independently, which is what actually produced the "opposite
+        # corners of a wide island" problem this offset-based clustering
+        # exists to prevent (there's no runtime reach correction in this
+        # sim -- see collection_pos's comment above).
+        #
+        # All 4 objects sit at the 4 corners of a small, *fixed-size*
+        # 0.4m x 0.4m square (offset, not normalized pos -- see fruit's
+        # comment above) centered on the shared region, instead of spread
+        # across it -- keeps them within real arm reach on every layout
+        # regardless of how big that layout's island happens to be. An
+        # earlier version instead compressed *normalized* pos toward
+        # fruit's corner, which (combined with ref_obj) crammed all 4
+        # objects into far too little of the *smallest* curated layout's
+        # region (measured: layout 2's full-depth region is only ~0.92m x
+        # 1.4m) and made RoboCasa's placement sampler retry _load_model()
+        # forever ("Cannot place all objects, failed for rejected"),
+        # stalling the sim thread long enough to time out unrelated
+        # /step_action calls. This fixed-meters 0.4m square was checked
+        # against the actual sampled full-depth region size on all 5
+        # FRUIT_SHOP_LAYOUT_IDS (via a standalone robosuite.make() +
+        # Counter.sample_reset_region() probe, not just guessed) and fits
+        # with margin on the tightest one (layout 21, ~1.4m x 0.8m) --
+        # worst-case pairwise object clearance is fruit-accepted at
+        # ~0.4m center distance vs. their combined ~0.355m half-size sum.
+        # Any layout/style combo this still doesn't fit falls back to
+        # RoboCasa's own outer _load_model() retry (a fresh style/seed),
+        # same as any other placement failure.
         cfgs.append(
             dict(
                 name="scale",
                 obj_groups="digital_scale",
                 placement=dict(
                     fixture=self.counter,
+                    ref_obj="fruit",
                     size=(0.3, 0.3),
-                    pos=(1.0, -1.0),
-                    sample_region_kwargs=dict(full_depth_region=True),
+                    pos=(0.0, 0.0),
+                    offset=(0.2, -0.2),
                 ),
             )
         )
@@ -254,9 +319,10 @@ class FruitShop(Kitchen):
                 obj_groups=self._basket_mjcf_path(exclude_ids=self.ACCEPTED_BASKET_EXCLUDE_IDS),
                 placement=dict(
                     fixture=self.counter,
+                    ref_obj="fruit",
                     size=(0.36, 0.36),
-                    pos=(1.0, -0.3),
-                    sample_region_kwargs=dict(full_depth_region=True),
+                    pos=(0.0, 0.0),
+                    offset=(0.2, 0.2),
                 ),
             )
         )
@@ -266,9 +332,10 @@ class FruitShop(Kitchen):
                 obj_groups=self._basket_mjcf_path(include_ids=self.BASKET_TRASH_BIN_IDS),
                 placement=dict(
                     fixture=self.counter,
+                    ref_obj="fruit",
                     size=(0.32, 0.32),
-                    pos=(-1.0, -0.3),
-                    sample_region_kwargs=dict(full_depth_region=True),
+                    pos=(0.0, 0.0),
+                    offset=(-0.2, 0.2),
                 ),
             )
         )

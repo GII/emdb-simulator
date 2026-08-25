@@ -316,7 +316,13 @@ class SceneLoader(Node):
         )
 
         self._create_env()
-        self._set_layout_style()
+        # _create_env() already resolved layout/style before its own
+        # robosuite.make()/env.reset() and set self.current_layout/style
+        # to match -- calling _set_layout_style() again here would just
+        # re-resolve a *different* value (for layout_id/style_id == -1)
+        # and set it up for the *next* reset, while leaving
+        # self.current_layout/style claiming a layout that hasn't
+        # actually been loaded yet.
         self._init_robot_joint_mapping()
         self._init_device()
 
@@ -429,12 +435,26 @@ class SceneLoader(Node):
             "robots": self.robot,
         }
         if self.is_kitchen_task:
+            # Resolved *before* robosuite.make()/env.reset() below, not
+            # left as -1 for robocasa's own internal random pick then
+            # "corrected" via a _set_layout_style() call afterward -- that
+            # ordering (used to be the pattern here) only ever updates
+            # self.env.layout_and_style_ids for the *next* reset; it can't
+            # retroactively change the layout a reset that already
+            # happened just loaded. Confirmed live: with layout_id=-1, the
+            # very first scene load used robocasa's own random layout
+            # (e.g. "layout: 7" in scene_loader's own startup log) despite
+            # _set_layout_style() claiming "layout=21" right after --
+            # that 21 was real, just one reset too late.
+            layout, style = self._resolve_layout_style()
             config["translucent_robot"] = False
-            config["layout_ids"] = [self.layout_id]
-            config["style_ids"] = [self.style_id]
+            config["layout_ids"] = [layout]
+            config["style_ids"] = [style]
             config["seed"] = self.env_seed
             if self.obj_groups is not None:
                 config["obj_groups"] = self.obj_groups
+            self.current_layout = layout
+            self.current_style = style
         if self.task == "KitchenLift":
             # custom_cameras is a KitchenLift-specific constructor kwarg (see
             # kitchen_lift_task.py); other Kitchen-family tasks don't accept it.
@@ -485,23 +505,38 @@ class SceneLoader(Node):
             self.episode_id += 1
             self.video_recorder.maybe_start_episode(self.episode_id)
 
+    def _resolve_layout_style(self):
+        """Resolve self.layout_id/style_id (-1 meaning "pick one") into
+        concrete ids. Shared by _create_env (before the very first
+        robosuite.make()/env.reset()) and _set_layout_style (before every
+        later reset) so a reset never runs one step behind whatever this
+        just resolved -- see _create_env's comment for why that ordering
+        matters."""
+        layout = self.layout_id
+        style = self.style_id
+
+        if layout == -1:
+            if self.task == "FruitShop":
+                # Pinned to 21 (one of FRUIT_SHOP_LAYOUT_IDS) instead of
+                # randomizing across the curated set -- keeps every episode
+                # on the same island size/shape while iterating on reach
+                # behavior, rather than reproducing across a moving target.
+                # Pass -p layout_id:=<n> explicitly to override.
+                layout = 21
+            else:
+                layout = int(np.random.choice(list(self.layouts.keys())))
+        if style == -1:
+            style = int(np.random.choice(list(self.styles.keys())))
+
+        return layout, style
+
     def _set_layout_style(self):
         if not self.is_kitchen_task:
             self.current_layout = None
             self.current_style = None
             return
 
-        layout = self.layout_id
-        style = self.style_id
-
-        if layout == -1:
-            if self.task == "FruitShop":
-                layout = int(np.random.choice(FRUIT_SHOP_LAYOUT_IDS))
-            else:
-                layout = int(np.random.choice(list(self.layouts.keys())))
-        if style == -1:
-            style = int(np.random.choice(list(self.styles.keys())))
-
+        layout, style = self._resolve_layout_style()
         self.env.layout_and_style_ids = [[layout, style]]
         self.current_layout = layout
         self.current_style = style
@@ -570,8 +605,13 @@ class SceneLoader(Node):
 
     def _reset_env_cb_impl(self, request, response):
         try:
-            self.env.reset()
+            # Resolve/apply the next layout+style *before* reset (like
+            # _reset_episode_cb_impl already does), not after -- setting
+            # self.env.layout_and_style_ids only affects the *next*
+            # env.reset(), so calling it after this one just leaves the
+            # scene that was actually (re)loaded one resolution behind.
             self._set_layout_style()
+            self.env.reset()
             self.device.start_control()
             self._init_device()
             self.episode_id += 1
@@ -748,10 +788,10 @@ class SceneLoader(Node):
             obs_dict["dest_pos"] = np.asarray(dest.pos, dtype=np.float64)
 
         # Generic pass-through for any task-exposed "<name>_pos" property
-        # (e.g. FruitShop's collection_pos/placed_pos/button_pos, all
-        # computed fixture-relative since RoboCasa kitchens are procedurally
-        # laid out per episode) -- same role as dest_pos above, generalized
-        # so new tasks don't need their own scene_loader changes for fixed,
+        # (e.g. FruitShop's collection_pos/placed_pos, both computed
+        # fixture-relative since RoboCasa kitchens are procedurally laid out
+        # per episode) -- same role as dest_pos above, generalized so new
+        # tasks don't need their own scene_loader changes for fixed,
         # fixture-relative target zones.
         for zone_attr in getattr(self.env, "OBS_ZONE_ATTRS", ()):
             value = getattr(self.env, zone_attr, None)
@@ -764,12 +804,26 @@ class SceneLoader(Node):
         # fixture-relative positions, cacheable), these are spawned objects
         # whose pose has to be read live from sim.data every step -- there's
         # no cached .pos to rely on.
+        # Also publishes "<name>_top_z" (world Z of the object's own
+        # top_site, e.g. a basket's rim) alongside "<name>_pos" -- a
+        # policy releasing something *into* one of these (FruitShop's
+        # accept_fruit/discard_fruit dropping a fruit into accepted/
+        # rejected) needs to clear that top, not just the object's body
+        # origin: some basket variants in the category are tall enough
+        # that lowering to a small fixed offset above body_xpos alone
+        # drives the gripper straight into the basket wall instead of
+        # over its rim. top_offset (misc/robosuite/robosuite/models/
+        # objects/objects.py's MujocoXMLObject) is the standard
+        # robosuite/robocasa per-asset "{prefix}top_site" convention, so
+        # this works for any object in OBS_LIVE_OBJECT_ATTRS, not just
+        # baskets specifically.
         for obj_name in getattr(self.env, "OBS_LIVE_OBJECT_ATTRS", ()):
             if obj_name in getattr(self.env, "objects", {}):
                 body_id = self.env.obj_body_id[obj_name]
-                obs_dict[f"{obj_name}_pos"] = np.asarray(
-                    self.env.sim.data.body_xpos[body_id], dtype=np.float64
-                )
+                body_pos = np.asarray(self.env.sim.data.body_xpos[body_id], dtype=np.float64)
+                obs_dict[f"{obj_name}_pos"] = body_pos
+                top_offset_z = float(self.env.objects[obj_name].top_offset[2])
+                obs_dict[f"{obj_name}_top_z"] = body_pos[2] + top_offset_z
 
         return obs_dict
 
