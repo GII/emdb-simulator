@@ -113,7 +113,6 @@ DIM_MIN = 0.03  # meters, matches fruit_shop_sim_discrete.py's generate_fruits()
 DIM_MAX = 0.1
 FRUIT_SENTINEL = {"distance": 1.9, "angle": 1.4, "dim_max": 0.1}  # "nothing here"
 MAX_MOTION_STEPS = 200
-FRUIT_IN_PLACED_POS_TOLERANCE = 0.05  # meters
 
 
 class FruitShopBridge(Node):
@@ -142,7 +141,6 @@ class FruitShopBridge(Node):
 
         # --- ported FruitShopSim state, single-arm-adapted -----------------
         self.iteration = 0
-        self.change_reward_iterations = {}
         # Unlike the reference's self.fruits (an abstract 0-3-item list),
         # this bridge only ever has one physical fruit object to act on
         # (see fruit_shop_task.py's own docstring), so the abstract
@@ -158,6 +156,10 @@ class FruitShopBridge(Node):
         self.scale_active = False
         self.fruit_correctly_accepted = False
         self.fruit_correctly_rejected = False
+        # Set (and read once by reward_classify_fruit_goal) when a *tested*
+        # fruit gets dropped in the wrong basket -- see
+        # reward_classify_fruit_goal's antipoint comment.
+        self.fruit_incorrectly_classified = False
         self.classify_fruit_reward = 0.0
         self.place_fruit_reward = 0.0
         # Set by _resolve_tested_fruit/_release_held_fruit when the fruit
@@ -191,9 +193,6 @@ class FruitShopBridge(Node):
         config = yaml.load(
             open(self.config_file, "r", encoding="utf-8"),
             Loader=yamlloader.ordereddict.CLoader,
-        )
-        self.change_reward_iterations = dict(
-            config.get("FruitShopBridge", {}).get("Stages", {})
         )
         self.setup_control_channel(config["Control"])
 
@@ -307,6 +306,7 @@ class FruitShopBridge(Node):
         self._pending_world_reset = False
         self.fruit_correctly_accepted = False
         self.fruit_correctly_rejected = False
+        self.fruit_incorrectly_classified = False
         self._last_obs = self.agent_bridge.reset()
         self.catched_fruit = None
         self.tested_fruit = None
@@ -335,32 +335,35 @@ class FruitShopBridge(Node):
         angle = float(np.arctan2(rel[0], rel[1]))
         return distance, angle
 
-    def fruit_in_placed_pos(self):
-        if self.catched_fruit or not self.fruit_available or self._last_obs is None:
-            return False
-        fruit_pos = self._last_obs.get("fruit_pos")
-        placed_pos = self._last_obs.get("placed_pos")
-        if fruit_pos is None or placed_pos is None:
-            return False
-        return float(np.linalg.norm(np.asarray(fruit_pos) - np.asarray(placed_pos))) < FRUIT_IN_PLACED_POS_TOLERANCE
 
     def update_reward_sensor(self):
         self.classify_fruit_reward = self.reward_classify_fruit_goal()
         self.place_fruit_reward = self.reward_place_fruit_goal()
 
     def reward_classify_fruit_goal(self):
-        stage2 = self.change_reward_iterations.get("stage2", float("inf"))
-        if self.iteration > stage2:
-            if self.fruit_correctly_accepted or self.fruit_correctly_rejected:
-                return 1.0
+        # No curriculum staging (deviates from the reference, which only
+        # ever returns 0.0/1.0 here and gates it behind
+        # change_reward_iterations['stage2']) -- always reflects the real
+        # outcome; pick_fruit/test_fruit already get their own reward from
+        # the architecture's generic effectance drives (effect_fruit_in_
+        # hand_data/effect_scales_active), so classify_fruit_goal only
+        # needs to cover the actual sort decision.
+        if self.fruit_correctly_accepted or self.fruit_correctly_rejected:
+            return 1.0
+        # Antipoint: a *tested* fruit (a real scale_state) dropped in the
+        # wrong basket -- not in the reference, added so a wrong
+        # classification reads as worse than simply not having resolved a
+        # fruit yet.
+        if self.fruit_incorrectly_classified:
+            return -1.0
         return 0.0
 
     def reward_place_fruit_goal(self):
-        stage0 = self.change_reward_iterations.get("stage0", 0)
-        stage1 = self.change_reward_iterations.get("stage1", float("inf"))
-        if stage0 < self.iteration <= stage1:
-            return 1.0 if self.fruit_in_placed_pos() else 0.0
-        return 1.0
+        # place_fruit is a distractor policy in this single-arm adaptation
+        # (it mattered for the reference's 2-arm hand-off, not here) --
+        # kept as a real, physically working action so it's still a
+        # plausible thing to try, but deliberately never rewarded.
+        return 0.0
 
     def publish_perceptions(self):
         fruit_entry = FruitMsg()
@@ -449,12 +452,7 @@ class FruitShopBridge(Node):
             # this is a perception fact (the scale's own sensor reading of
             # the fruit sitting on it, publish_perceptions's scale_entry.
             # state, normalized downstream by FruitShopPerception's
-            # n_states: 3), not itself a reward, so it shouldn't be gated
-            # behind change_reward_iterations['stage1'] the way
-            # reward_place_fruit_goal's leniency is. That stage1 check
-            # used to leave scale_state stuck at 0 ("unknown") for the
-            # entire curriculum's early iterations even though the fruit
-            # was already sitting on the scale.
+            # n_states: 3), not a reward -- no curriculum staging here.
             self.scale_active = True
             if self.scale_state == 0:
                 self.scale_state = 1 if self.rng.uniform() > 0.5 else 2
@@ -495,7 +493,9 @@ class FruitShopBridge(Node):
         if success:
             if self.scale_state == correct_state:
                 setattr(self, correct_attr, True)
-                self.scale_state = 0
+            else:
+                self.fruit_incorrectly_classified = True
+            self.scale_state = 0
             self.scale_active = False
             self.tested_fruit = None
             self.fruit_available = False  # resolved -- out of play until ask_nicely

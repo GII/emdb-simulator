@@ -376,12 +376,3 @@ LTM:
                     drive_name: prospection_drive
                     neighbors: [{"name": "prospection_cnode", "node_type": "CNode"}]
                     ltm_id: ltm_0
-
-# Read directly by fruit_shop_bridge.py (not by the LTM/MainLoop side) to
-# gate reward availability -- same values/semantics as the original
-# DiscreteEventSimulator.Stages block this replaces.
-FruitShopBridge:
-    Stages:
-        stage0: 1000
-        stage1: 2000
-        stage2: 2500
