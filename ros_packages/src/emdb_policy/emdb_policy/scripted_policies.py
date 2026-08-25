@@ -44,7 +44,7 @@ PLACE_LOWER_OFFSET = 0.05  # meters above dest_pos to lower to before releasing
 # to release into it, when the target has one -- see _container_top_z.
 CONTAINER_RIM_CLEARANCE = 0.05
 RELEASE_SETTLE_STEPS = 10
-ASK_NICELY_WAIT_STEPS = 30  # default idle duration for IdleMotion
+ASK_NICELY_WAIT_STEPS = 3  # default idle duration for IdleMotion
 
 
 class _FrameControlMixin:
