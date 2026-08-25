@@ -161,12 +161,12 @@ class FruitShopBridge(Node):
         self.classify_fruit_reward = 0.0
         self.place_fruit_reward = 0.0
         # Set by _resolve_tested_fruit/_release_held_fruit when the fruit
-        # just got physically dropped into accepted/rejected -- checked
-        # (and cleared) by executed_policy_callback *after* it computes
-        # this cycle's reward/perceptions, not reset_world() immediately
-        # here, so reward_classify_fruit_goal() still gets one chance to
-        # read fruit_correctly_accepted/rejected before reset_world()
-        # zeroes them back out for the next episode.
+        # just got physically dropped into accepted/rejected -- consumed
+        # at the *start* of the next executed_policy_callback, not
+        # immediately, so the e-MDB architecture gets its normal
+        # uninterrupted "read perceptions -> read rewards" pass over this
+        # resolution's classify_fruit reward before the world (and that
+        # reward) resets out from under it. See executed_policy_callback.
         self._pending_world_reset = False
 
         # --- physics-facing client ------------------------------------
@@ -249,6 +249,25 @@ class FruitShopBridge(Node):
         return response
 
     def executed_policy_callback(self, request, response):
+        if self._pending_world_reset:
+            # Deferred from the *previous* call's _resolve_tested_fruit/
+            # _release_held_fruit (a fruit just got physically dropped
+            # into accepted/rejected) until now instead of resetting
+            # immediately at the end of that call -- MainLoop's own
+            # per-iteration sequence is "execute policy -> read
+            # perceptions -> ... -> read rewards" (all synchronous, before
+            # it ever requests the *next* policy execution), so by the
+            # time this callback fires again, the architecture has
+            # already had its one uninterrupted chance to read the
+            # classify_fruit reward from that resolution. Resetting at
+            # the end of that same call instead (tried first) raced
+            # reset_world()'s own perception/reward publish against
+            # whatever MainLoop was reading right then, with no guarantee
+            # the real value was seen before it got overwritten by the
+            # freshly-reset one.
+            self._pending_world_reset = False
+            self.reset_world()
+
         self.get_logger().info(f"Executing policy {request.policy} (iteration={self.iteration})")
         self.perceive_closest_fruit()
         method = getattr(self, request.policy + "_policy", None)
@@ -279,16 +298,6 @@ class FruitShopBridge(Node):
         self.perceive_closest_fruit()
         self.update_reward_sensor()
         self.publish_perceptions()
-        if self._pending_world_reset:
-            # Deferred from _resolve_tested_fruit/_release_held_fruit (the
-            # fruit was just physically dropped into accepted or rejected)
-            # until after the update_reward_sensor()/publish_perceptions()
-            # above -- reset_world() itself zeroes fruit_correctly_accepted/
-            # rejected as its first step, so resetting any earlier would
-            # wipe that flag before reward_classify_fruit_goal() ever got a
-            # chance to read it as a successful classification.
-            self._pending_world_reset = False
-            self.reset_world()
         response.success = bool(success)
         return response
 
