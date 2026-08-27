@@ -237,6 +237,15 @@ class SceneLoader(Node):
         # rl-mode heartbeat timer can re-publish it between steps without
         # re-stepping physics (see _mdb_perception_heartbeat).
         self._last_success = False
+        # Set via /mark_episode_success by a driving bridge node whose real
+        # success isn't computed by env._check_success() (e.g. FruitShop --
+        # see fruit_shop_task.py's own docstring: its success/reward lives
+        # in emdb_policy's fruit_shop_bridge.py, a separate process this
+        # node has no visibility into otherwise). OR'd into the success
+        # value _apply_env_action_and_publish computes, so video_recorder's
+        # keep_successes mode (and StepInfo.success) reflect the task's
+        # real outcome instead of always False for tasks like this one.
+        self._external_success = False
         # Debounces "Success achieved!" in the teleop render loop to once per
         # episode (rising edge only), instead of once per render tick for as
         # long as _check_success() stays True.
@@ -313,6 +322,12 @@ class SceneLoader(Node):
             MarkObjectRotten,
             "/mark_object_rotten",
             self._mark_object_rotten_cb,
+        )
+
+        self.mark_episode_success_srv = self.create_service(
+            Trigger,
+            "/mark_episode_success",
+            self._mark_episode_success_cb,
         )
 
         self._create_env()
@@ -455,9 +470,10 @@ class SceneLoader(Node):
                 config["obj_groups"] = self.obj_groups
             self.current_layout = layout
             self.current_style = style
-        if self.task == "KitchenLift":
-            # custom_cameras is a KitchenLift-specific constructor kwarg (see
-            # kitchen_lift_task.py); other Kitchen-family tasks don't accept it.
+            # custom_cameras is generic to any Kitchen-family task
+            # (CustomCamerasMixin, camera_config.py) -- every task
+            # registered in this package (KitchenLift, FruitShop) mixes
+            # it in, so this doesn't need to special-case by task name.
             config["custom_cameras"] = self.custom_cameras
 
         self.get_logger().info(
@@ -611,12 +627,17 @@ class SceneLoader(Node):
             # env.reset(), so calling it after this one just leaves the
             # scene that was actually (re)loaded one resolution behind.
             self._set_layout_style()
+            # See _reset_episode_cb_impl's comment: close out the outgoing
+            # episode's video before env.reset() rebuilds self.env.sim.
+            self.video_recorder.close_episode()
             self.env.reset()
             self.device.start_control()
             self._init_device()
             self.episode_id += 1
             self.step_id = 0
             self.video_recorder.maybe_start_episode(self.episode_id)
+            self._last_success = False
+            self._external_success = False
             response.success = True
             response.message = "Environment reset successfully"
             self.get_logger().info(response.message)
@@ -861,7 +882,7 @@ class SceneLoader(Node):
 
     def _apply_env_action_and_publish(self, env_action):
         obs, reward, _done, _info = self.env.step(env_action)
-        success = bool(self.env._check_success())
+        success = bool(self.env._check_success()) or self._external_success
         self._last_success = success
         self.step_id += 1
 
@@ -1006,6 +1027,18 @@ class SceneLoader(Node):
                 self.style_id = int(request.style_id)
 
             self._set_layout_style()
+            # Finalize the outgoing episode's video *before* env.reset() --
+            # a deferred (keep_successes) episode replays its buffered
+            # states straight into self.env.sim (see
+            # VideoRecorder._finish_deferred_episode), which only works
+            # while self.env.sim still matches the model those states were
+            # captured from. FruitShop's env.reset() does a hard_reset
+            # (fresh procedural layout, often a different total qpos size
+            # -- e.g. a different set of jointed fixtures), so closing
+            # after reset (as maybe_start_episode()'s own internal
+            # close_episode() call would) replays into the wrong-shaped
+            # model and fails with a qpos broadcast error.
+            self.video_recorder.close_episode()
             obs = self.env.reset()
             self.device.start_control()
             self.all_prev_gripper_actions = [
@@ -1027,6 +1060,7 @@ class SceneLoader(Node):
             self._publish_step_info(reward=0.0, terminated=False, truncated=False, success=False)
             self._publish_progress(False)
             self._last_success = False
+            self._external_success = False
 
             response.success = True
             response.message = (
@@ -1198,6 +1232,26 @@ class SceneLoader(Node):
             response.success = False
             response.message = f"Failed to mark {name!r} rotten: {e}"
 
+        return response
+
+    def _mark_episode_success_cb(self, request, response):
+        return self._run_on_sim_thread(lambda: self._mark_episode_success_cb_impl(request, response))
+
+    def _mark_episode_success_cb_impl(self, request, response):
+        # Lets a driving bridge node (e.g. fruit_shop_bridge.py) report a
+        # real success this node has no other way to see -- see
+        # self._external_success's own comment in __init__. Also flag the
+        # video recorder directly: this call typically lands *after* the
+        # episode's last real _apply_env_action_and_publish() step (e.g.
+        # fruit_shop_bridge resolves the episode, then just resets --  no
+        # further env.step() happens), so capture_frame() -- the only
+        # other place video_recorder learns about success -- would
+        # otherwise never see success=True for this episode.
+        self._external_success = True
+        if getattr(self, "video_recorder", None) is not None:
+            self.video_recorder.mark_success()
+        response.success = True
+        response.message = "ok"
         return response
 
     def _publish_joint_states(self):
@@ -1390,6 +1444,10 @@ class SceneLoader(Node):
                 self._teleop_success_logged = False
 
             if input_ac_dict is None:
+                # See _reset_episode_cb_impl's comment: close out the
+                # outgoing episode's video before env.reset() rebuilds
+                # self.env.sim.
+                self.video_recorder.close_episode()
                 self.env.reset()
                 self.device.start_control()
                 self.device.clear_reset()
@@ -1403,6 +1461,10 @@ class SceneLoader(Node):
             self._apply_env_action_and_publish(env_action)
 
             if self.device._reset_state:
+                # See _reset_episode_cb_impl's comment: close out the
+                # outgoing episode's video before env.reset() rebuilds
+                # self.env.sim.
+                self.video_recorder.close_episode()
                 self.env.reset()
                 self.device.start_control()
                 self.device.clear_reset()

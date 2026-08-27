@@ -161,7 +161,7 @@ class FruitShopBridge(Node):
         # reward_classify_fruit_goal's antipoint comment.
         self.fruit_incorrectly_classified = False
         self.classify_fruit_reward = 0.0
-        self.place_fruit_reward = 0.0
+        self.test_fruit_reward = 0.0
         # Set by _resolve_tested_fruit/_release_held_fruit when the fruit
         # just got physically dropped into accepted/rejected -- consumed
         # at the *start* of the next executed_policy_callback, not
@@ -182,7 +182,7 @@ class FruitShopBridge(Node):
         self.scales_pub = self.create_publisher(ScaleListMsg, "/emdb/simulator/sensor/scales", 10)
         self.fruit_in_hand_pub = self.create_publisher(Bool, "/emdb/simulator/sensor/fruit_in_hand", 10)
         self.classify_fruit_pub = self.create_publisher(Float32, "/emdb/simulator/sensor/classify_fruit", 10)
-        self.place_fruit_pub = self.create_publisher(Float32, "/emdb/simulator/sensor/place_fruit", 10)
+        self.test_fruit_pub = self.create_publisher(Float32, "/emdb/simulator/sensor/test_fruit", 10)
 
     # ------------------------------------------------ yaml / e-MDB wiring
     def load_configuration(self):
@@ -338,16 +338,17 @@ class FruitShopBridge(Node):
 
     def update_reward_sensor(self):
         self.classify_fruit_reward = self.reward_classify_fruit_goal()
-        self.place_fruit_reward = self.reward_place_fruit_goal()
+        self.test_fruit_reward = self.reward_test_fruit_goal()
 
     def reward_classify_fruit_goal(self):
         # No curriculum staging (deviates from the reference, which only
         # ever returns 0.0/1.0 here and gates it behind
         # change_reward_iterations['stage2']) -- always reflects the real
-        # outcome; pick_fruit/test_fruit already get their own reward from
-        # the architecture's generic effectance drives (effect_fruit_in_
-        # hand_data/effect_scales_active), so classify_fruit_goal only
-        # needs to cover the actual sort decision.
+        # outcome. pick_fruit still only gets reward from the
+        # architecture's generic effect_fruit_in_hand_data effectance
+        # goal; test_fruit has its own dedicated test_fruit_drive/mission
+        # now (see reward_test_fruit_goal), classify_fruit_goal only needs
+        # to cover the actual sort decision.
         if self.fruit_correctly_accepted or self.fruit_correctly_rejected:
             return 1.0
         # Antipoint: a *tested* fruit (a real scale_state) dropped in the
@@ -358,12 +359,16 @@ class FruitShopBridge(Node):
             return -1.0
         return 0.0
 
-    def reward_place_fruit_goal(self):
-        # place_fruit is a distractor policy in this single-arm adaptation
-        # (it mattered for the reference's 2-arm hand-off, not here) --
-        # kept as a real, physically working action so it's still a
-        # plausible thing to try, but deliberately never rewarded.
-        return 0.0
+    def reward_test_fruit_goal(self):
+        # 1.0 for as long as a tested fruit is actively sitting on the
+        # scale with a real, determined state (set by test_fruit_policy,
+        # cleared once accept_fruit/discard_fruit resolves it or the world
+        # resets) -- dedicated test_fruit_drive/test_fruit_mission
+        # (fruit_shop_experiment.yaml), replacing the old place_fruit_
+        # drive slot. Takes over from the generic effect_scales_active
+        # effectance goal (which rewards *any* scales:active change, not
+        # specifically "successfully tested a fruit").
+        return 1.0 if self.scale_active else 0.0
 
     def publish_perceptions(self):
         fruit_entry = FruitMsg()
@@ -387,7 +392,7 @@ class FruitShopBridge(Node):
 
         self.fruit_in_hand_pub.publish(Bool(data=bool(self.fruit_in_hand)))
         self.classify_fruit_pub.publish(Float32(data=float(self.classify_fruit_reward)))
-        self.place_fruit_pub.publish(Float32(data=float(self.place_fruit_reward)))
+        self.test_fruit_pub.publish(Float32(data=float(self.test_fruit_reward)))
 
     # ------------------------------------------------ scripted-motion runner
     def _run_motion(self, motion, max_steps=MAX_MOTION_STEPS):
@@ -493,6 +498,13 @@ class FruitShopBridge(Node):
         if success:
             if self.scale_state == correct_state:
                 setattr(self, correct_attr, True)
+                # scene_loader.py can't see this outcome on its own --
+                # FruitShop._check_success() always returns False by design
+                # (see its docstring), so video_recorder's keep_successes
+                # mode would otherwise never keep a single FruitShop
+                # episode no matter how many fruits get classified
+                # correctly.
+                self.agent_bridge.mark_episode_success()
             else:
                 self.fruit_incorrectly_classified = True
             self.scale_state = 0

@@ -15,6 +15,7 @@ import numpy as np
 import rclpy
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
+from std_srvs.srv import Trigger
 
 from emdb_interfaces.msg import Observation, StepInfo
 from emdb_interfaces.srv import (
@@ -66,6 +67,7 @@ class AgentBridge(Node):
         self._step_raw_cli = self.create_client(StepActionRaw, "/step_action_raw")
         self._reset_cli = self.create_client(ResetEpisode, "/reset_episode")
         self._mark_rotten_cli = self.create_client(MarkObjectRotten, "/mark_object_rotten")
+        self._mark_episode_success_cli = self.create_client(Trigger, "/mark_episode_success")
 
     def start(self):
         """Spin this node on a background thread so blocking step()/reset() calls work."""
@@ -85,6 +87,7 @@ class AgentBridge(Node):
             (self._step_raw_cli, "/step_action_raw"),
             (self._reset_cli, "/reset_episode"),
             (self._mark_rotten_cli, "/mark_object_rotten"),
+            (self._mark_episode_success_cli, "/mark_episode_success"),
         )
         for cli, name in clients:
             if not cli.wait_for_service(timeout_sec=timeout_sec):
@@ -165,6 +168,19 @@ class AgentBridge(Node):
         )
         if not response.success:
             raise RuntimeError(f"/mark_object_rotten failed: {response.message}")
+
+    def mark_episode_success(self):
+        """Tell scene_loader.py this episode really succeeded (see its
+        /mark_episode_success -- for tasks like FruitShop whose real
+        success isn't computed by env._check_success(), OR'd into the
+        success value it feeds video_recorder/StepInfo.success)."""
+        request = Trigger.Request()
+
+        response = self._call(
+            self._mark_episode_success_cli, request, "/mark_episode_success", self._step_timeout_sec
+        )
+        if not response.success:
+            raise RuntimeError(f"/mark_episode_success failed: {response.message}")
 
     def step(self, dx=0.0, dy=0.0, dz=0.0, droll=0.0, dpitch=0.0, dyaw=0.0,
              base_dx=0.0, base_dy=0.0, base_dyaw=0.0, grasp=0, next_arm=0, next_robot=0):

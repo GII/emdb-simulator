@@ -27,9 +27,10 @@ import numpy as np
 import robocasa.macros as robocasa_macros
 from robocasa.environments.kitchen.kitchen import *
 from robocasa.models.objects.kitchen_objects import OBJ_CATEGORIES
+from emdb_simulator.core.camera_config import CustomCamerasMixin
 
 
-class FruitShop(Kitchen):
+class FruitShop(CustomCamerasMixin, Kitchen):
     """Pick a fruit, test it on the scale, accept/discard it, and place it.
 
     A single UR5e+2FG7 arm plays every role the two-hand reference

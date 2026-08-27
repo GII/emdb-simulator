@@ -5,9 +5,10 @@ robosuite's REGISTERED_ENVS (via robosuite's EnvMeta), so it must be
 imported before robosuite.make() is called with this env name.
 """
 from robocasa.environments.kitchen.kitchen import *
+from emdb_simulator.core.camera_config import CustomCamerasMixin
 
 
-class KitchenPlace(Kitchen):
+class KitchenPlace(CustomCamerasMixin, Kitchen):
     """Pick up an object from one fixture and place it on/in another.
 
     Generated from the "place" template -- mirrors robocasa's own

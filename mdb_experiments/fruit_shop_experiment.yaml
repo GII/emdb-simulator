@@ -146,11 +146,11 @@ LTM:
                     purpose_type: 'Mission'
                     terminal: True
             -
-                name: place_fruit_mission
+                name: test_fruit_mission
                 class_name: cognitive_nodes.robot_purpose.RobotPurpose
                 parameters:
                     weight: 1.0
-                    drive_id: 'place_fruit_drive'
+                    drive_id: 'test_fruit_drive'
                     purpose_type: 'Mission'
             -
                 name: novelty_need
@@ -199,13 +199,13 @@ LTM:
                     min_eval: 0.8
                     neighbors: [{"name": "classify_fruit_mission", "node_type": "RobotPurpose"}]
             -
-                name: place_fruit_drive
+                name: test_fruit_drive
                 class_name: cognitive_nodes.drive.DriveExponential
                 parameters:
-                    input_topic: /emdb/simulator/sensor/place_fruit
+                    input_topic: /emdb/simulator/sensor/test_fruit
                     input_msg: std_msgs.msg.Float32
                     min_eval: 0.8
-                    neighbors: [{"name": "place_fruit_mission", "node_type": "RobotPurpose"}]
+                    neighbors: [{"name": "test_fruit_mission", "node_type": "RobotPurpose"}]
             -
                 name: novelty_drive
                 class_name: cognitive_nodes.novelty.DriveNovelty

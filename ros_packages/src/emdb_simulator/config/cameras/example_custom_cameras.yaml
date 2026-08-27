@@ -46,6 +46,13 @@ cameras:
     pos: [3.481, -3.918, 0.983]
     quat: [0.480936, 0.500199, 0.518952, 0.49919]
 
+  # World-fixed elevated view, pos/quat captured the same way as
+  # robot0_agentview_center_rear above (hand-framed in preview_camera,
+  # pos + xyaxes copied from the MuJoCo camera and converted to quat).
+  - name: overhead_view
+    pos: [2.703, -3.681, 2.289]
+    quat: [0.937321, 0.348387, -0.002613, -0.007030]
+
   # UNVERIFIED guess at a pulled-back "front view": mirroring pos.x off the
   # rear camera above ([-3.0, ...] instead of [3.0, ...]) actually rendered
   # as another rear-ish angle, not front -- so pos.x sign alone doesn't

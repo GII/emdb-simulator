@@ -228,6 +228,15 @@ class VideoRecorder:
             self._camera_unavailable = True
             self.close_episode()
 
+    def mark_success(self):
+        """Flag the current episode as successful out-of-band, without a
+        matching capture_frame() call -- for callers (e.g.
+        scene_loader's /mark_episode_success) whose success signal can
+        arrive after the last real physics step of an episode, when no
+        further capture_frame(success=True) call is coming to record it."""
+        if self._current_episode_id is not None:
+            self._episode_success = True
+
     def _finish_deferred_episode(self):
         """Render+encode a buffered episode now that we know it succeeded.
 
