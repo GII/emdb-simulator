@@ -375,7 +375,9 @@ node translating the architecture's `cognitive_node_interfaces`
 the discrete-event simulator), plus new `Perception`/`Policy`/`WorldModel`
 Python classes on the architecture side for the "lift" domain. Both are
 explicit followups — see `mdb_experiments/lift_experiment.yaml`'s own TODO
-comments for the current state of that gap.
+comments for the current state of that gap. This is specific to "lift" —
+FruitShop already has its own bridge node, see {ref}`cesga-fruit-shop`
+below.
 ```
 
 A full run takes roughly 1.5–2 minutes end to end before results are ready
@@ -416,6 +418,45 @@ architecture container):
 mount failed, falling back to extraction` on every `singularity exec`
 (including the pull/priming commands above) is expected on this cluster,
 not an error to chase -- see the FUSE note in step 2.
+```
+
+(cesga-fruit-shop)=
+## 7a. Running the FruitShop experiment
+
+Unlike step 7's connectivity smoke test,
+[`hpc/cesga/fruit_shop_with_architecture.sbatch`](../../../hpc/cesga/fruit_shop_with_architecture.sbatch)
+runs a real, long-running FruitShop experiment: FruitShop already has its
+own bridge node
+(`ros_packages/src/emdb_policy/emdb_policy/fruit_shop_bridge.py`)
+translating the architecture's `cognitive_node_interfaces` calls into this
+repo's `/step_action`/`/reset_episode` services, so no extra bridging work
+is needed. The script automates that file's own module docstring's manual
+5-terminal sequence (`scene_loader`; `commander`; `ltm`; a one-shot
+`commander/load_config` call; `fruit_shop_bridge`) across the same
+two-container layout as step 7.
+
+```bash
+sbatch hpc/cesga/fruit_shop_with_architecture.sbatch
+sbatch --array=0-4 hpc/cesga/fruit_shop_with_architecture.sbatch   # 5 parallel seeds
+```
+
+It targets the `medium` partition with a 48h budget (this is a real
+experiment, not a 15-minute check) and defaults to recording only
+successful episodes (`record_video_keep_successes:=true`, no fixed
+`record_video_episodes` range) to `$STORE/emdb_runs/.../videos/` — override
+`RECORD_VIDEO_EPISODES`/`RECORD_VIDEO_CAMERA` to change that. It shares
+`ARCH_SIF`/`ARCH_HOST_WORKSPACE` with step 7's script.
+
+```{warning}
+This script hasn't been run end to end on the actual cluster yet — it was
+written by mirroring `emdb_with_architecture.sbatch`/
+`train_baseline_cpu.sbatch`'s already-proven patterns and
+`fruit_shop_bridge.py`'s documented manual sequence, not verified against
+FT3 directly. The header comment flags the biggest unverified assumption
+(whether the architecture image's Python environment already satisfies
+`fruit_shop_bridge`'s own pip dependencies once its `install/` is sourced
+inside the simulator container) — check `fruit_shop_bridge.log` in the
+job's output directory first if it fails on import.
 ```
 
 ## 8. Downloading results
