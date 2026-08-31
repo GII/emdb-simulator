@@ -138,8 +138,19 @@ PIDS+=("$!")
 # emdb_with_architecture.sbatch's pattern of one singularity exec per
 # image, not per process, to avoid extra full-extraction overhead (no
 # FUSE on this cluster -- see docs/source/howto/running_on_cesga.md).
+#
+# Also needs mdb_experiments/ bound in: commander (started here) is what
+# actually calls open() on CONFIG_FILE when it services fruit_shop_bridge's
+# commander/load_experiment request in step 4 -- the path travels over a
+# ROS 2 service call, but the file read happens in whichever process's
+# filesystem namespace handles that request, i.e. THIS container, not the
+# simulator one. Binding it only into BIND_ARGS (used by the simulator's
+# singularity exec calls, step 1/4) left commander unable to see it,
+# producing "Couldn't load experiment. File ... not found" even though the
+# file exists on the host and in the simulator container.
 singularity exec \
     --bind "$ARCH_HOST_WORKSPACE:/workspace/emdb_develop:ro" \
+    --bind "$HOST_WORKSPACE/mdb_experiments:/opt/emdb/mdb_experiments" \
     "$ARCH_SIF" bash -c "
         set -e
         source /opt/ros/humble/setup.bash
