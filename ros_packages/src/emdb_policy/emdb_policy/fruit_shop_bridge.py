@@ -237,15 +237,38 @@ class FruitShopBridge(Node):
         self.update_reward_sensor()
         command = getattr(data, "command", "")
         if command == "reset_world":
-            self.reset_world()
+            self._safe_reset_world()
         elif command == "end":
             self.get_logger().info("Ending fruit_shop_bridge as requested by LTM...")
             rclpy.shutdown()
 
     def world_reset_callback(self, request, response):
-        self.reset_world()
-        response.success = True
+        response.success = self._safe_reset_world()
         return response
+
+    def _safe_reset_world(self):
+        """reset_world(), but never let an AgentBridge failure (e.g. a
+        /reset_episode timeout because the sim is momentarily overloaded --
+        seen live: a RoboCasa hard_reset occasionally outran even the 90s
+        budget under CESGA CPU contention) escape as an exception.
+
+        Same rationale as executed_policy_callback's own try/except around
+        `method()`: an exception raised inside a ROS 2 callback has no
+        default recovery in rclpy and kills the whole long-running node
+        (and with it the rest of the job's --time budget). reset_world()
+        itself is called from three callbacks (this one, control_callback's
+        "reset_world" command, and executed_policy_callback's own deferred
+        reset) that were all missing this guard -- only the *policy call*
+        inside executed_policy_callback was ever wrapped, not the resets
+        that surround it. Returns whether the reset actually succeeded.
+        """
+        try:
+            self.reset_world()
+            return True
+        except Exception as e:
+            self.get_logger().error(f"reset_world() failed unexpectedly: {e}")
+            self.get_logger().error(traceback.format_exc())
+            return False
 
     def executed_policy_callback(self, request, response):
         if self._pending_world_reset:
@@ -265,7 +288,7 @@ class FruitShopBridge(Node):
             # the real value was seen before it got overwritten by the
             # freshly-reset one.
             self._pending_world_reset = False
-            self.reset_world()
+            self._safe_reset_world()
 
         self.get_logger().info(f"Executing policy {request.policy} (iteration={self.iteration})")
         self.perceive_closest_fruit()

@@ -26,8 +26,21 @@
 # ^ `medium`'s 3-day limit gives headroom over --time for a long sparse-
 #   reward run; drop both for a quick smoke test.
 
+set -euo pipefail
+# ^ Set here too, not just inside _common.sh: if the source below fails,
+# this makes the job abort immediately with bash's own clear "No such
+# file or directory" instead of silently continuing with STORE/SIF/
+# HOST_WORKSPACE/BIND_ARGS/OUT_DIR all unset -- which previously cascaded
+# into confusing "Permission denied" errors from every "$OUT_DIR/foo.log"
+# redirect collapsing to "/foo.log".
 VARIANT=cpu
-source "$SLURM_SUBMIT_DIR/hpc/cesga/_common.sh"
+# Locate _common.sh via the same HOST_WORKSPACE default/override
+# _common.sh itself uses for everything else (not $SLURM_SUBMIT_DIR) so
+# `sbatch` can be invoked from any cwd -- not just from inside the repo
+# checkout -- as long as HOST_WORKSPACE (env var, or this default) points
+# at it.
+HOST_WORKSPACE="${HOST_WORKSPACE:-$HOME/emdb_simulator_develop}"
+source "$HOST_WORKSPACE/hpc/cesga/_common.sh"
 
 # --algo sac (off-policy, replay buffer) tends to make better use of rare
 # sparse successes than ppo here -- see docs/source/howto/training_rl.md.
