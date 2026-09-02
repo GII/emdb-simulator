@@ -496,7 +496,11 @@ class SceneLoader(Node):
             self.env = EnclosingWallRenderWrapper(
                 self.env, alpha=0.1, enabled=not self.show_walls
             )
-            install_enclosing_wall_hotkeys(self.env)
+            # Esc/[/] hotkeys toggle wall transparency in the on-screen
+            # window -- meaningless (and one more long-lived Xlib
+            # connection that can die under it) when nobody's watching one.
+            if not self.headless:
+                install_enclosing_wall_hotkeys(self.env)
 
         self.env_info = json.dumps(config)
         if self.collect_demos:

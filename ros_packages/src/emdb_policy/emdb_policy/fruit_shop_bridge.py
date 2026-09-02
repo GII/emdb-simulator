@@ -102,7 +102,7 @@ from core.utils import class_from_classname, resolve_seed
 from std_msgs.msg import Bool, Float32
 from simulators_interfaces.msg import FruitListMsg, FruitMsg, ScaleListMsg, ScaleMsg
 
-from emdb_policy.agent_bridge import AgentBridge
+from emdb_policy.agent_bridge import AgentBridge, SceneLoaderUnavailableError
 from emdb_policy.scripted_policies import (
     PickFruitMotion,
     TransportReleaseMotion,
@@ -265,6 +265,13 @@ class FruitShopBridge(Node):
         try:
             self.reset_world()
             return True
+        except SceneLoaderUnavailableError:
+            self.get_logger().fatal(
+                "scene_loader appears to have died during reset_world() -- this "
+                "cannot self-heal within this job; propagating to shut down "
+                "fruit_shop_bridge."
+            )
+            raise
         except Exception as e:
             self.get_logger().error(f"reset_world() failed unexpectedly: {e}")
             self.get_logger().error(traceback.format_exc())
@@ -299,6 +306,14 @@ class FruitShopBridge(Node):
             return response
         try:
             success = method()
+        except SceneLoaderUnavailableError:
+            self.get_logger().fatal(
+                f"scene_loader appears to have died while executing policy "
+                f"{request.policy!r} -- this cannot self-heal within this job; "
+                "shutting down fruit_shop_bridge so the sbatch script ends the job "
+                "instead of burning the remaining time budget on a dead simulator."
+            )
+            raise
         except Exception as e:
             # A policy failing unexpectedly (e.g. an AgentBridge service
             # call raising because the sim rejected a request) used to

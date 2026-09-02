@@ -43,6 +43,13 @@ def observation_to_dict(msg: Observation):
     return obs
 
 
+class SceneLoaderUnavailableError(RuntimeError):
+    """Raised when a service call fails because its server is gone (scene_loader
+    died), not because it was merely slow. Distinct from TimeoutError, which
+    callers may treat as transient/retryable (e.g. a slow hard_reset under CPU
+    contention); this never self-heals within the same job."""
+
+
 class AgentBridge(Node):
     def __init__(self, node_name="emdb_agent_bridge", step_timeout_sec=10.0, reset_timeout_sec=90.0):
         super().__init__(node_name)
@@ -104,6 +111,16 @@ class AgentBridge(Node):
             self._cv.notify_all()
 
     def _call(self, client, request, name, timeout_sec):
+        # Distinguish "server gone" from "server slow": a dead scene_loader
+        # will never answer no matter how long we wait, so detect that
+        # explicitly (via the cheap, non-blocking service_is_ready() check)
+        # instead of always raising a plain TimeoutError -- callers can then
+        # tell a permanent failure apart from a transient one worth retrying.
+        if not client.service_is_ready():
+            raise SceneLoaderUnavailableError(
+                f"Service {name} is not available -- scene_loader appears to have died"
+            )
+
         event = threading.Event()
         holder = {}
 
@@ -113,6 +130,12 @@ class AgentBridge(Node):
 
         client.call_async(request).add_done_callback(_on_done)
         if not event.wait(timeout=timeout_sec):
+            if not client.service_is_ready():
+                raise SceneLoaderUnavailableError(
+                    f"Service call to {name} timed out after {timeout_sec}s and the "
+                    "service is no longer available -- scene_loader appears to have "
+                    "died mid-call"
+                )
             raise TimeoutError(f"Service call to {name} timed out after {timeout_sec}s")
         return holder["response"]
 
