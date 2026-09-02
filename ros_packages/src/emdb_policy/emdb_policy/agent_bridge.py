@@ -88,7 +88,7 @@ class AgentBridge(Node):
             self._executor.shutdown()
         self.destroy_node()
 
-    def wait_for_services(self, timeout_sec=10.0):
+    def wait_for_services(self, timeout_sec=300.0):
         clients = (
             (self._step_cli, "/step_action"),
             (self._step_raw_cli, "/step_action_raw"),
