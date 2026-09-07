@@ -33,6 +33,7 @@ setup(
         'console_scripts': [
             'policy_node = emdb_policy.policy_node:main',
             'fruit_shop_bridge = emdb_policy.fruit_shop_bridge:main',
+            'ripe_fruit_bridge = emdb_policy.ripe_fruit_bridge:main',
             'train_sb3 = emdb_policy.train_sb3:main',
             'replay_demo = emdb_policy.replay_demo:main',
             'prepare_lift_demo_episodes = emdb_policy.scripts.prepare_lift_demo_episodes:main',

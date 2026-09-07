@@ -11,3 +11,4 @@ from emdb_simulator.core import kitchen_lift_task  # noqa: F401  registers Kitch
 # --- new tasks are appended below this line by scripts/create_task.py ---
 from emdb_simulator.core import kitchen_place_task  # noqa: F401  registers KitchenPlace
 from emdb_simulator.core import fruit_shop_task  # noqa: F401  registers FruitShop
+from emdb_simulator.core import ripe_fruit_task  # noqa: F401  registers RipeFruit

@@ -542,7 +542,45 @@ class SceneLoader(Node):
                 # on the same island size/shape while iterating on reach
                 # behavior, rather than reproducing across a moving target.
                 # Pass -p layout_id:=<n> explicitly to override.
+                #
+                # RipeFruit was briefly pinned here too (matching FruitShop,
+                # at the user's request) but reverted: confirmed live
+                # (2026-09) that layout 21 sends ChooseRipeFruit's own
+                # fruit0/fruit1 placement (sample_region_kwargs=dict(
+                # loc="left_right", ref=self.blender), choose_ripe_fruit.py)
+                # into RoboCasa's _load_model() retry loop indefinitely (27+
+                # retries observed, never converging) -- layout 21's
+                # blender-adjacent counter region doesn't fit that
+                # placement request the way it fits FruitShop's own very
+                # different 4-object cluster. RipeFruit stays on random
+                # layout selection, which was reliable across every layout
+                # drawn in testing so far.
                 layout = 21
+            elif self.task == "RipeFruit":
+                # Pinned to 55 as a diagnostic/mitigation experiment for the
+                # EGL/GLFW "could not create window" crash seen during long
+                # local MainLoop runs (never observed on FruitShop, which is
+                # itself pinned to a single layout above -- see FruitShop's
+                # own comment). Confirmed live that FruitShop survives 100+
+                # resets without the crash while RipeFruit's random-layout
+                # selection hit it within 30-270 resets across several runs;
+                # the working theory is that loading many different
+                # procedurally-distinct kitchens stresses/leaks MuJoCo's
+                # render-context recreation (every hard_reset rebuilds it)
+                # faster than repeatedly reloading the same one. This is a
+                # hypothesis test, not a guaranteed fix -- if crash frequency
+                # doesn't improve, that's evidence against the theory, not
+                # wasted effort.
+                #
+                # 55, not 21: layout 21 specifically breaks RipeFruit's own
+                # fruit0/fruit1 placement sampler (see FruitShop's comment
+                # above) -- 55 was exercised repeatedly across this session's
+                # physics test harnesses (pick_fruit/open_blender/
+                # place_in_blender all completing) with no such issue.
+                # Style still randomizes -- only the room/fixture geometry is
+                # pinned, matching FruitShop's own precedent exactly.
+                # Pass -p layout_id:=<n> explicitly to override.
+                layout = 55
             else:
                 layout = int(np.random.choice(list(self.layouts.keys())))
         if style == -1:
