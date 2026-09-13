@@ -29,8 +29,8 @@ sys.modules.setdefault("ament_index_python.packages", _ament_index_python_packag
 
 # -- Project information -------------------------------------------------
 project = "EMDB Simulator"
-author = "Fabian Alvarez"
-copyright = "2026, Fabian Alvarez"
+author = "Fabian Alvarez Juarez"
+copyright = "2026, Fabian Alvarez Juarez"
 release = "0.0.0"
 
 # -- General configuration ------------------------------------------------

@@ -14,6 +14,16 @@ lives under [`docs/`](docs/source/index.md) and is built with Sphinx — see
 already rendered on GitHub Pages once [`docs.yml`](.github/workflows/docs.yml)
 has deployed it.
 
+## About this project
+
+This is the Trabajo Fin de Máster (Master's Thesis) of **Fabian Alvarez
+Juarez**, for the **Máster en Informática Industrial y Robótica** at the
+**Universidade da Coruña (UDC)**, carried out within the **Grupo Integrado de
+Ingeniería (GII)**. See
+[`docs/source/about.md`](docs/source/about.md) for the full project title
+(in English, Castellano, and Galego) and acknowledgments, including the
+computing resources provided by CESGA.
+
 ## Repository layout
 
 ```text

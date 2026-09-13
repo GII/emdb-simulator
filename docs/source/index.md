@@ -10,6 +10,7 @@ robosuite/robocasa/MuJoCo directly.
 :maxdepth: 2
 :caption: Contents
 
+about
 getting_started
 architecture
 howto/index
@@ -17,6 +18,11 @@ interfaces/index
 api/index
 llms
 ```
+
+This project is the Master's Thesis (TFM) of Fabian Alvarez Juarez, for the
+Máster en Informática Industrial y Robótica at the Universidade da Coruña,
+carried out within the Grupo Integrado de Ingeniería (GII) — see {doc}`about`
+for the full acknowledgments, including CESGA's computing resources.
 
 ## At a glance
 
