@@ -11,6 +11,7 @@ robosuite/robocasa/MuJoCo directly.
 :caption: Contents
 
 about
+videos
 getting_started
 architecture
 howto/index
