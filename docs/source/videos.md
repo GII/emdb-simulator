@@ -23,3 +23,14 @@ allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; pic
 allowfullscreen></iframe>
 
 [Watch on YouTube](https://youtu.be/3fDojWuT9Dk)
+
+## Ripe fruit success
+
+Successful grasp and identification of ripe fruit.
+
+<iframe width="560" height="315" src="https://www.youtube.com/embed/L8O2Y-KrEZQ"
+title="Ripe fruit success" frameborder="0"
+allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+allowfullscreen></iframe>
+
+[Watch on YouTube](https://youtu.be/L8O2Y-KrEZQ)
